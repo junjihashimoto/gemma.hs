@@ -227,7 +227,7 @@ gemma3_1BConfig = GemmaConfig
   , gcLocalRopeScaling = 1.0    -- local_rope_scaling_factor
   , gcGlobalRopeScaling = 1.0   -- global_rope_scaling_factor
   , gcQueryHeadDimNormalize = True  -- query_head_dim_normalize
-  , gcUseZeroCenteredRMSNorm = False -- Gemma 3 uses STANDARD RMSNorm (weight * norm), NOT zero-centered (1+weight)*norm
+  , gcUseZeroCenteredRMSNorm = True -- Gemma 3 uses ZERO-CENTERED RMSNorm: (x/rms) * (1+weight), NOT standard (x/rms)*weight
   }
 
 -- | Complete Gemma model with all weights
@@ -916,11 +916,24 @@ runGemmaInferenceCached model@GemmaModel{..} tokenIds mCache = evalContT $ do
   -- Using FP32 for embeddings until FP16 bug is fixed
   rawEmbedding <- runEmbeddingGPU gmContext tokenIds gmEmbeddingTensor gmEmbeddingShader False gcHiddenDim
 
+  -- DEBUG: Check RAW embedding BEFORE scaling
+  liftIO $ do
+    debug <- lookupEnv "DEBUG"
+    when (debug == Just "1" || debug == Just "true") $ do
+      waitAll gmContext
+      debugRawEmbed <- T.fromGPU gmContext rawEmbedding gcHiddenDim
+      debugPrint $ "DEBUG RAW embedding BEFORE scaling (first 10): " ++ show (V.take 10 debugRawEmbed)
+      debugPrint $ "DEBUG RAW embedding stats: min=" ++ show (V.minimum debugRawEmbed :: Float) ++ " max=" ++ show (V.maximum debugRawEmbed :: Float)
+
   -- Step 1.5: Apply embedding normalization (Gemma 3 requirement!)
   -- Gemma 3 multiplies embeddings by sqrt(hidden_dim) ≈ 33.94 for 1152
   -- This is critical - without it, all predictions are wrong!
+  -- TEMPORARY: Using CPU scaling until GPU shader is debugged
   let embeddingScale = sqrt (fromIntegral gcHiddenDim :: Float)
-  hiddenTensor <- runScaleVectorGPU gmContext rawEmbedding embeddingScale gcHiddenDim
+  liftIO $ waitAll gmContext
+  rawEmbedCPU <- liftIO $ T.fromGPU gmContext rawEmbedding gcHiddenDim
+  let scaledEmbed = V.map (* embeddingScale) rawEmbedCPU
+  hiddenTensor <- createTensorWithData gmContext (Shape [gcHiddenDim]) scaledEmbed
 
   -- DEBUG: Check embedding output (only if DEBUG enabled)
   liftIO $ do

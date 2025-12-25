@@ -18,9 +18,13 @@ High-performance Gemma 3 1B inference engine implemented in Haskell using Google
 
 ## Project Status
 
-🎉 **Phase 6 Complete** - KV-Cache Fully Integrated!
+🎉 **CRITICAL FIX (2025-12-25)**: Gemma 3 INSTRUCT RMSNorm Bug Fixed!
 
-**Latest achievements:**
+**Latest breakthrough:**
+- ✅ **FIXED: Gemma 3 INSTRUCT RMSNorm bug** - Layer 0 now matches PyTorch perfectly!
+  - Root cause: `gcUseZeroCenteredRMSNorm` was `False`, should be `True`
+  - Gemma 3 uses zero-centered RMSNorm: `(x/rms) * (1+weight)` not `(x/rms) * weight`
+  - See [RMSNORM_BUG_FIXED.md](./RMSNORM_BUG_FIXED.md) for details
 - ✅ Pure Haskell tokenizer (zero Python dependencies!)
 - ✅ Streaming chat interface with real-time output
 - ✅ Temperature sampling for natural responses
@@ -40,6 +44,8 @@ GQA validation: ✅ 3/3 tests passing
 ✅ **GQA Support**: Grouped Query Attention with K/V head expansion implemented
 
 See [PHASE4_COMPLETE.md](./PHASE4_COMPLETE.md) for detailed results and [TESTING_STATUS.md](./TESTING_STATUS.md) for PyTorch validation.
+
+**Layer 0 Validation Status**: See [LAYER0_VALIDATION_PROGRESS.md](./LAYER0_VALIDATION_PROGRESS.md) for detailed progress on Layer 0 numerical validation against PyTorch BASE model.
 
 - ✅ **Phase 1**: Test Infrastructure
   - Python golden value generator

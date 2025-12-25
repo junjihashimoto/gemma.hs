@@ -6,7 +6,6 @@ module Gemma.Layers.Scale
   ) where
 
 import Graphics.WebGPU.Dawn.ContT
-import Graphics.WebGPU.Dawn.Types (Tensor(..), KernelCode, Context)
 
 -- | Shader to scale a vector by a constant
 -- output[i] = input[i] * scale
@@ -44,6 +43,10 @@ runScaleVectorGPU ctx inputTensor scale size = do
 
   -- Create and dispatch kernel
   kernel <- createKernel ctx code [inputTensor, outputTensor] (WorkgroupSize numWorkgroups 1 1)
-  liftIO $ dispatchKernel ctx kernel
+  liftIO $ dispatchKernelAsync ctx kernel
+
+  -- CRITICAL: Wait for GPU operation to complete before returning!
+  -- Without this, the tensor may not have the scaled values yet
+  liftIO $ waitAll ctx
 
   pure outputTensor

@@ -20,11 +20,14 @@ def load_fp32_model(model_path):
             weights[key] = f.get_tensor(key).float()
     return weights
 
-def rmsnorm(x, weight, eps=1e-6):
-    """Standard RMSNorm"""
+def rmsnorm(x, weight, eps=1e-6, zero_centered=False):
+    """RMSNorm with optional zero-centering (Gemma 3 feature)"""
     variance = x.pow(2).mean(-1, keepdim=True)
     x_normed = x * torch.rsqrt(variance + eps)
-    return x_normed * weight
+    if zero_centered:
+        return x_normed * (1.0 + weight)  # Gemma 3: zero-centered formula
+    else:
+        return x_normed * weight  # Standard formula
 
 def apply_rope(q, k, position, head_dim, rope_base=10000.0):
     """Apply RoPE (Rotary Position Embedding)"""
@@ -59,7 +62,7 @@ print()
 
 # Load FP32 model (original Gemma 3 that Q4 was derived from)
 print("Loading Gemma 3 FP32 model...")
-model_path = "../models/gemma3-1b.safetensors"  # From /Users/junji.hashimoto/git/dawn/gemma.hs
+model_path = "/Users/junji.hashimoto/git/dawn/models/gemma3-1b-official-instruct/model.safetensors"  # From /Users/junji.hashimoto/git/dawn/gemma.hs
 weights = load_fp32_model(model_path)
 print(f"Loaded {len(weights)} weight tensors")
 
@@ -89,7 +92,7 @@ for layer_idx in range(26):
 
     # Pre-attention norm
     input_norm = weights[f"{prefix}.input_layernorm.weight"]
-    x_norm = rmsnorm(x, input_norm)
+    x_norm = rmsnorm(x, input_norm, zero_centered=True)  # Gemma 3
     if layer_idx == 0:
         print(f"  After input RMSNorm: min={x_norm.min():.6f}, max={x_norm.max():.6f}")
 
@@ -117,11 +120,11 @@ for layer_idx in range(26):
 
         q_normed = torch.zeros_like(q_heads)
         for h in range(num_heads):
-            q_normed[h] = rmsnorm(q_heads[h], q_norm_weight)
+            q_normed[h] = rmsnorm(q_heads[h], q_norm_weight, zero_centered=True)  # Gemma 3
 
         k_normed = torch.zeros_like(k_heads)
         for h in range(num_kv_heads):
-            k_normed[h] = rmsnorm(k_heads[h], k_norm_weight)
+            k_normed[h] = rmsnorm(k_heads[h], k_norm_weight, zero_centered=True)  # Gemma 3
 
         q = q_normed.view(-1)
         k = k_normed.view(-1)
@@ -175,7 +178,7 @@ for layer_idx in range(26):
     # Post-attention norm (Gemma 3) - use appropriate key
     post_attn_key = f"{prefix}.post_attention_layernorm.weight" if f"{prefix}.post_attention_layernorm.weight" in weights else f"{prefix}.post_attention_norm.weight"
     post_attn_norm = weights[post_attn_key]
-    x_norm2 = rmsnorm(x, post_attn_norm)
+    x_norm2 = rmsnorm(x, post_attn_norm, zero_centered=True)  # Gemma 3
     if layer_idx == 0:
         print(f"  After post-attn RMSNorm: min={x_norm2.min():.6f}, max={x_norm2.max():.6f}")
 
@@ -209,7 +212,7 @@ for layer_idx in range(26):
 
 # Final norm
 final_norm = weights["model.norm.weight"]
-final_hidden = rmsnorm(x, final_norm)
+final_hidden = rmsnorm(x, final_norm, zero_centered=True)  # Gemma 3
 print(f"  After final RMSNorm: min={final_hidden.min():.6f}, max={final_hidden.max():.6f}")
 
 # LM head (use tied weights - embeddings)

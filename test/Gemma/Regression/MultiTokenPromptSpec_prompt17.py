@@ -105,7 +105,7 @@ def forward_layer(x, layer_idx, weights, position, kv_cache=None):
     
     # Pre-attention norm
     input_norm = weights[f"{prefix}.input_layernorm.weight"]
-    x_norm = rmsnorm(x, input_norm)
+    x_norm = rmsnorm(x, input_norm, zero_centered=True)  # Gemma 3 uses zero-centered RMSNorm
     
     # Attention projections
     q_weight = weights[f"{prefix}.self_attn.q_proj.weight"]
@@ -166,7 +166,7 @@ def forward_layer(x, layer_idx, weights, position, kv_cache=None):
     if post_attn_key not in weights:
         post_attn_key = f"{prefix}.post_attention_norm.weight"
     post_attn_norm = weights[post_attn_key]
-    x_norm2 = rmsnorm(x, post_attn_norm)
+    x_norm2 = rmsnorm(x, post_attn_norm, zero_centered=True)  # Gemma 3 uses zero-centered RMSNorm
     
     # FFN
     gate_weight = weights[f"{prefix}.mlp.gate_proj.weight"]
@@ -188,7 +188,7 @@ def forward_layer(x, layer_idx, weights, position, kv_cache=None):
     post_ffn_key = f"{prefix}.post_feedforward_layernorm.weight"
     if post_ffn_key in weights:
         post_ffn_norm = weights[post_ffn_key]
-        ffn_out = rmsnorm(ffn_out, post_ffn_norm)
+        ffn_out = rmsnorm(ffn_out, post_ffn_norm, zero_centered=True)  # Gemma 3 uses zero-centered RMSNorm
 
     # Second residual
     x = x + ffn_out
@@ -198,8 +198,8 @@ def forward_layer(x, layer_idx, weights, position, kv_cache=None):
 print("=== PyTorch Reference: 17-Token Prompt ===\n")
 
 # Load model
-print("Loading FP32 model...")
-weights = load_fp32_model("../models/gemma3-1b.safetensors")
+print("Loading FP32 INSTRUCT model...")
+weights = load_fp32_model("/Users/junji.hashimoto/git/dawn/models/gemma3-1b-official-instruct/model.safetensors")
 print(f"Loaded {len(weights)} weight tensors\n")
 
 # Prompt tokens from Haskell DEBUG output
@@ -227,7 +227,7 @@ for token_idx, token in enumerate(prompt_tokens):
         x, kv_caches[layer_idx] = forward_layer(x, layer_idx, weights, token_idx, kv_caches[layer_idx])
     
     # Final norm
-    x_norm = rmsnorm(x, final_norm)
+    x_norm = rmsnorm(x, final_norm, zero_centered=True)  # Gemma 3 uses zero-centered RMSNorm
     
     # LM head (tied with embeddings)
     logits = F.linear(x_norm, embed_table)
@@ -261,6 +261,6 @@ for token_idx, token in enumerate(prompt_tokens):
             "top5_logits": [top5_values[i].item() for i in range(5)]
         }
         
-        with open("test/Gemma/Regression/MultiTokenPromptSpec_prompt17.json", "w") as f:
+        with open("/Users/junji.hashimoto/git/dawn/gemma.hs/test/Gemma/Regression/MultiTokenPromptSpec_prompt17.json", "w") as f:
             json.dump(reference, f, indent=2)
         print("\n✅ Saved reference to MultiTokenPromptSpec_prompt17.json")

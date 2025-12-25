@@ -28,6 +28,7 @@ library
     Gemma.Layers.MLP
     Gemma.Layers.Embedding
     Gemma.Layers.Scale
+    Gemma.Layers.Convert
     Gemma.Layers.TransformerBlock
     Gemma.Layers.TransformerBlockGPU
     Gemma.Quantization.Q4

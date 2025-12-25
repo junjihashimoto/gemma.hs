@@ -40,6 +40,8 @@ import Graphics.WebGPU.Dawn.ContT
 import Graphics.WebGPU.Dawn.Types (KernelCode)
 import qualified Data.Vector.Storable as V
 import Data.Vector.Storable (Vector)
+import Control.Monad.IO.Class (liftIO)
+import System.Environment (lookupEnv)
 
 import Gemma.Layers.RMSNorm (runRMSNormWithContext)
 import Gemma.Layers.Linear (runLinearWithContext)
@@ -48,6 +50,15 @@ import Gemma.Layers.Attention (runAttentionWithContext)
 import Gemma.Layers.AttentionCached (runAttentionCachedWithContext)
 import Gemma.Layers.MLP (runGeGLUWithContext, runElementwiseAddWithContext)
 import Gemma.KVCache (LayerKVCache)
+
+-- | Debug print helper (checks DEBUG env var)
+debugPrint :: String -> IO ()
+debugPrint msg = do
+  debug <- lookupEnv "DEBUG"
+  case debug of
+    Just "1" -> putStrLn msg
+    Just "true" -> putStrLn msg
+    _ -> pure ()
 
 -- | Expand K/V heads for Grouped Query Attention (GQA)
 --
@@ -316,6 +327,9 @@ runTransformerBlockCached input layer cache position numHeads numKVHeads headDim
 
   -- Step 1: Pre-attention RMSNorm
   xNorm1 <- runRMSNormWithContext ctx input (tlAttnNormWeights layer)
+
+  -- DEBUG: Compare with PyTorch's pre-attention RMSNorm output
+  liftIO $ debugPrint $ "  DEBUG xNorm1 (pre-attn RMSNorm) first 10: " ++ show (V.take 10 xNorm1)
 
   -- Step 2: Q, K, V projections (only for current token)
   let qSize = numHeads * headDim
