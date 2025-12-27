@@ -322,7 +322,8 @@ autoregressiveGenerateStreaming model tokenizer promptTokens maxTokens _promptLe
       -- DEBUG: Show what token was generated
       putStrLn $ "SAMPLED: token=" ++ show nextToken ++ " logit=" ++ show (logits V.! nextToken)
 
-      if nextToken == eosId tokenizer
+      -- For instruct models, stop on <end_of_turn> instead of <eos>
+      if nextToken == endOfTurnId tokenizer
         then do
           putStrLn ""
           return (V.toList promptTokens)
@@ -360,7 +361,8 @@ autoregressiveGenerateStreaming model tokenizer promptTokens maxTokens _promptLe
       let temperature = 0.7
       nextToken <- sampleWithTemperature temperature logits
 
-      if nextToken == eosId tokenizer
+      -- For instruct models, stop on <end_of_turn> instead of <eos>
+      if nextToken == endOfTurnId tokenizer
         then do
           putStrLn ""
           return tokens
@@ -388,8 +390,8 @@ autoregressiveGenerate model tokenizer promptTokens maxTokens = go (V.toList pro
       let temperature = 0.7
       nextToken <- sampleWithTemperature temperature logits
 
-      -- Check for EOS token
-      if nextToken == eosId tokenizer
+      -- For instruct models, check for <end_of_turn> instead of <eos>
+      if nextToken == endOfTurnId tokenizer
         then return tokens
         else do
           -- Add token and continue

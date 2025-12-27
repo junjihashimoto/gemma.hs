@@ -24,6 +24,7 @@ module Gemma.Tokenizer
     -- * Special tokens
   , bosId
   , eosId
+  , endOfTurnId
   , unkId
   , padId
 
@@ -48,6 +49,7 @@ data Tokenizer = Tokenizer
   , tokVocab :: !BPE.Vocab
   , tokBosId :: !Int
   , tokEosId :: !Int
+  , tokEndOfTurnId :: !Int
   , tokUnkId :: !Int
   , tokPadId :: !Int
   } deriving (Show, Eq)
@@ -62,6 +64,7 @@ loadTokenizer path = do
       -- Find special token IDs
       bosIdx = findTokenId pieces "<bos>"
       eosIdx = findTokenId pieces "<eos>"
+      endOfTurnIdx = findTokenId pieces "<end_of_turn>"
       unkIdx = findTokenId pieces "<unk>"
       padIdx = findTokenId pieces "<pad>"
 
@@ -70,6 +73,7 @@ loadTokenizer path = do
     , tokVocab = vocab
     , tokBosId = bosIdx
     , tokEosId = eosIdx
+    , tokEndOfTurnId = endOfTurnIdx
     , tokUnkId = unkIdx
     , tokPadId = padIdx
     }
@@ -104,6 +108,10 @@ bosId = tokBosId
 -- | Get EOS (End of Sequence) token ID
 eosId :: Tokenizer -> Int
 eosId = tokEosId
+
+-- | Get end_of_turn token ID (for chat/instruct models)
+endOfTurnId :: Tokenizer -> Int
+endOfTurnId = tokEndOfTurnId
 
 -- | Get UNK (Unknown) token ID
 unkId :: Tokenizer -> Int
