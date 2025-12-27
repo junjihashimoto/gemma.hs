@@ -671,7 +671,8 @@ loadGemmaModel modelPath config = do
               }
 
         -- Upload consolidated tensors to GPU
-        packedTensor <- T.createTensorWithDataPacked ctx (Shape [V.length allPacked]) U4 allPacked
+        -- Use Graphics.WebGPU.Dawn.Types.U32 for GPU tensor creation (not Gemma.SafeTensors.U32)
+        packedTensor <- T.createTensorWithDataPacked ctx (Shape [V.length allPacked]) Graphics.WebGPU.Dawn.Types.U32 allPacked
         scalesTensor <- T.createTensorWithData ctx (Shape [V.length allScales]) allScales
 
         -- Create Q4 CONSOLIDATED shaders (use offsets into consolidated buffers)

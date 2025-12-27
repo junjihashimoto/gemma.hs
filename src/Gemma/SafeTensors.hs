@@ -35,8 +35,12 @@ module Gemma.SafeTensors
     SafeTensorsFile(..)
   , TensorInfo(..)
   , DType(..)
+  , TensorData(..)
     -- * Loading
   , loadSafeTensors
+    -- * Saving
+  , saveSafeTensors
+  , createTensorData
     -- * Querying
   , getTensor
   , getTensorTyped
@@ -387,7 +391,16 @@ getTensorU32 SafeTensorsFile{..} name = case Map.lookup name stTensors of
           let wordPtr = castPtr ptr :: Ptr Word32
           -- Force immediate copy of all elements
           V.generateM numElements $ \i -> peekElemOff wordPtr i
-      _ -> error $ "getTensorU32: Expected U32 dtype, got " ++ show tiDType
+      I32 -> do
+        -- Q4 packed data is stored as I32 for PyTorch compatibility
+        -- Reinterpret I32 bits as U32 (same bit pattern, different interpretation)
+        let numElements = numBytes `div` 4
+        BS.useAsCString tensorBytes $ \ptr -> do
+          let int32Ptr = castPtr ptr :: Ptr Int32
+          V.generateM numElements $ \i -> do
+            i32 <- peekElemOff int32Ptr i
+            pure (fromIntegral i32 :: Word32)  -- Reinterpret bits
+      _ -> error $ "getTensorU32: Expected U32 or I32 dtype, got " ++ show tiDType
 
 -- | Check if a tensor has Q4 quantized weights
 -- Q4 weights are stored as two tensors:
@@ -395,8 +408,8 @@ getTensorU32 SafeTensorsFile{..} name = case Map.lookup name stTensors of
 --   - {name}_q4_scales: F32 array (one scale per 32-weight block)
 hasQ4Weight :: SafeTensorsFile -> Text -> Bool
 hasQ4Weight st name =
-  hasTensor st (name <> "_q4_packed") &&
-  hasTensor st (name <> "_q4_scales")
+  hasTensor st (name <> ".q4_packed") &&
+  hasTensor st (name <> ".q4_scales")
 
 -- | Load Q4 quantized weight pair
 -- Returns: (packed nibbles, scales)
@@ -404,8 +417,8 @@ hasQ4Weight st name =
 --   - scales: [out_size * in_size / 32] Float vector
 loadQ4Weight :: SafeTensorsFile -> Text -> IO (Vector Word32, Vector Float)
 loadQ4Weight st name = do
-  packed <- getTensorU32 st (name <> "_q4_packed")
-  scales <- getTensor st (name <> "_q4_scales")
+  packed <- getTensorU32 st (name <> ".q4_packed")
+  scales <- getTensor st (name <> ".q4_scales")
   pure (packed, scales)
 
 -- | Load Q4 weight and dequantize to Float vector
@@ -456,3 +469,97 @@ dequantizeQ4Vector packed scales =
 
            -- Dequantize: weight = (nibble - 7.5) * scale
        in (nibble - 7.5) * scale
+
+-- ============================================================================
+-- Saving SafeTensors Files
+-- ============================================================================
+
+-- | Tensor data for saving
+data TensorData = TensorData
+  { tdName :: !Text
+  , tdDType :: !DType
+  , tdShape :: ![Int]
+  , tdData :: !ByteString
+  } deriving (Show)
+
+-- | Create tensor data from a typed vector
+createTensorData :: Storable a => Text -> DType -> [Int] -> Vector a -> TensorData
+createTensorData name dtype shape vec = TensorData
+  { tdName = name
+  , tdDType = dtype
+  , tdShape = shape
+  , tdData = vectorToByteString vec
+  }
+
+-- | Save tensors to SafeTensors format
+saveSafeTensors :: FilePath -> [TensorData] -> IO ()
+saveSafeTensors path tensors = do
+  -- Calculate offsets for each tensor
+  let tensorsWithOffsets = calculateOffsets tensors
+
+  -- Build JSON header
+  let header = buildHeader tensorsWithOffsets
+      headerBytes = BL.toStrict $ Aeson.encode header
+      headerLen = BS.length headerBytes
+
+  -- Build file: [8-byte header length][JSON header][tensor data]
+  let headerLenBytes = word64ToLE (fromIntegral headerLen)
+      allTensorData = BS.concat [tdData td | (td, _, _) <- tensorsWithOffsets]
+      fileData = BS.concat [headerLenBytes, headerBytes, allTensorData]
+
+  -- Write to file
+  BS.writeFile path fileData
+
+-- | Calculate byte offsets for each tensor
+calculateOffsets :: [TensorData] -> [(TensorData, Int, Int)]
+calculateOffsets = go 0
+  where
+    go _ [] = []
+    go offset (td:tds) =
+      let size = BS.length (tdData td)
+          end = offset + size
+      in (td, offset, end) : go end tds
+
+-- | Build JSON header with tensor metadata
+buildHeader :: [(TensorData, Int, Int)] -> Aeson.Value
+buildHeader tensors =
+  let tensorObjects = [ (Key.fromText (tdName td),
+                         Aeson.object
+                           [ ("dtype", dtypeToJSON (tdDType td))
+                           , ("shape", Aeson.toJSON (tdShape td))
+                           , ("data_offsets", Aeson.toJSON [start, end])
+                           ])
+                      | (td, start, end) <- tensors
+                      ]
+  in Aeson.object tensorObjects
+
+-- | Convert DType to JSON string
+dtypeToJSON :: DType -> Aeson.Value
+dtypeToJSON F32 = Aeson.String "F32"
+dtypeToJSON F16 = Aeson.String "F16"
+dtypeToJSON BF16 = Aeson.String "BF16"
+dtypeToJSON F64 = Aeson.String "F64"
+dtypeToJSON I32 = Aeson.String "I32"
+dtypeToJSON I64 = Aeson.String "I64"
+dtypeToJSON U32 = Aeson.String "U32"
+dtypeToJSON U64 = Aeson.String "U64"
+
+-- | Encode Word64 as little-endian bytes
+word64ToLE :: Word64 -> ByteString
+word64ToLE w = BS.pack
+  [ fromIntegral (w .&. 0xFF)
+  , fromIntegral ((w `shiftR` 8) .&. 0xFF)
+  , fromIntegral ((w `shiftR` 16) .&. 0xFF)
+  , fromIntegral ((w `shiftR` 24) .&. 0xFF)
+  , fromIntegral ((w `shiftR` 32) .&. 0xFF)
+  , fromIntegral ((w `shiftR` 40) .&. 0xFF)
+  , fromIntegral ((w `shiftR` 48) .&. 0xFF)
+  , fromIntegral ((w `shiftR` 56) .&. 0xFF)
+  ]
+
+-- | Convert a storable vector to ByteString
+vectorToByteString :: Storable a => Vector a -> ByteString
+vectorToByteString vec = unsafePerformIO $ do
+  V.unsafeWith vec $ \ptr -> do
+    let numBytes = V.length vec * sizeOf (V.head vec)
+    BS.packCStringLen (castPtr ptr, numBytes)
