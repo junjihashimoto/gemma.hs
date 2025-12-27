@@ -100,7 +100,9 @@ runTransformerBlockCachedGPU ctx inputTensor layer cache position numHeads numKV
     when (debug == Just "1" || debug == Just "true") $ do
       waitAll ctx
       debugInput <- T.fromGPU ctx inputTensor hiddenDim :: IO (V.Vector Float)
-      debugPrint $ "  DEBUG TransformerBlock INPUT (first 10): " ++ show (V.take 10 debugInput)
+      let inputMean = V.sum debugInput / fromIntegral (V.length debugInput) :: Float
+          inputStd = sqrt $ V.sum (V.map (\x -> (x - inputMean) * (x - inputMean)) debugInput) / fromIntegral (V.length debugInput) :: Float
+      debugPrint $ "  DEBUG [POS=" ++ show position ++ "] INPUT to Layer 0: mean=" ++ show inputMean ++ ", std=" ++ show inputStd ++ ", first_10: " ++ show (V.take 10 debugInput)
       debugPrint $ "  DEBUG TransformerBlock INPUT all zeros? " ++ show (V.all (== 0.0) (debugInput :: V.Vector Float))
 
   -- Step 1: Pre-attention RMSNorm (GPU) - writes to pre-allocated buffer
@@ -114,8 +116,9 @@ runTransformerBlockCachedGPU ctx inputTensor layer cache position numHeads numKV
     when (debug == Just "1" || debug == Just "true") $ do
       waitAll ctx
       debugNorm <- T.fromGPU ctx xNorm1 hiddenDim :: IO (V.Vector Float)
-      debugPrint $ "  DEBUG after RMSNorm (first 10): " ++ show (V.take 10 debugNorm)
-      debugPrint $ "  DEBUG after RMSNorm stats: min=" ++ show (V.minimum debugNorm :: Float) ++ " max=" ++ show (V.maximum debugNorm :: Float)
+      let normMean = V.sum debugNorm / fromIntegral (V.length debugNorm) :: Float
+          normStd = sqrt $ V.sum (V.map (\x -> (x - normMean) * (x - normMean)) debugNorm) / fromIntegral (V.length debugNorm) :: Float
+      debugPrint $ "  DEBUG [POS=" ++ show position ++ "] after RMSNorm: mean=" ++ show normMean ++ ", std=" ++ show normStd ++ ", first_10: " ++ show (V.take 10 debugNorm)
 
   -- Step 2: Q/K/V projections (GPU) - writes to pre-allocated buffers
   -- Use Q4 path if Q4 weights and shader are available (consolidated version)
@@ -154,10 +157,15 @@ runTransformerBlockCachedGPU ctx inputTensor layer cache position numHeads numKV
       debugQ <- T.fromGPU ctx qTensor qSize :: IO (V.Vector Float)
       debugK <- T.fromGPU ctx kTensor kvSize :: IO (V.Vector Float)
       debugV <- T.fromGPU ctx vTensor kvSize :: IO (V.Vector Float)
-      debugPrint $ "  DEBUG after Q proj (first 10): " ++ show (V.take 10 debugQ)
-      debugPrint $ "  DEBUG after K proj (first 10): " ++ show (V.take 10 debugK)
-      debugPrint $ "  DEBUG after V proj (first 10): " ++ show (V.take 10 debugV)
-      debugPrint $ "  DEBUG Q stats: min=" ++ show (V.minimum debugQ :: Float) ++ " max=" ++ show (V.maximum debugQ :: Float)
+      let qMean = V.sum debugQ / fromIntegral (V.length debugQ) :: Float
+          qStd = sqrt $ V.sum (V.map (\x -> (x - qMean) * (x - qMean)) debugQ) / fromIntegral (V.length debugQ) :: Float
+          kMean = V.sum debugK / fromIntegral (V.length debugK) :: Float
+          kStd = sqrt $ V.sum (V.map (\x -> (x - kMean) * (x - kMean)) debugK) / fromIntegral (V.length debugK) :: Float
+          vMean = V.sum debugV / fromIntegral (V.length debugV) :: Float
+          vStd = sqrt $ V.sum (V.map (\x -> (x - vMean) * (x - vMean)) debugV) / fromIntegral (V.length debugV) :: Float
+      debugPrint $ "  DEBUG [POS=" ++ show position ++ "] after Q proj (BEFORE QKNorm): mean=" ++ show qMean ++ ", std=" ++ show qStd ++ ", first_10: " ++ show (V.take 10 debugQ)
+      debugPrint $ "  DEBUG [POS=" ++ show position ++ "] after K proj (BEFORE QKNorm): mean=" ++ show kMean ++ ", std=" ++ show kStd ++ ", first_10: " ++ show (V.take 10 debugK)
+      debugPrint $ "  DEBUG [POS=" ++ show position ++ "] after V proj: mean=" ++ show vMean ++ ", std=" ++ show vStd ++ ", first_10: " ++ show (V.take 10 debugV)
 
   -- Step 3: Optional QK-Norm (Gemma 3) (GPU) - writes to pre-allocated buffers
   case tlQNormTensor of
@@ -178,8 +186,12 @@ runTransformerBlockCachedGPU ctx inputTensor layer cache position numHeads numKV
         waitAll ctx
         debugQNorm <- T.fromGPU ctx qNorm qSize :: IO (V.Vector Float)
         debugKNorm <- T.fromGPU ctx kNorm kvSize :: IO (V.Vector Float)
-        debugPrint $ "  DEBUG after QKNorm (first 10): " ++ show (V.take 10 debugQNorm)
-        debugPrint $ "  DEBUG QNorm stats: min=" ++ show (V.minimum debugQNorm :: Float) ++ " max=" ++ show (V.maximum debugQNorm :: Float)
+        let qNormMean = V.sum debugQNorm / fromIntegral (V.length debugQNorm) :: Float
+            qNormStd = sqrt $ V.sum (V.map (\x -> (x - qNormMean) * (x - qNormMean)) debugQNorm) / fromIntegral (V.length debugQNorm) :: Float
+            kNormMean = V.sum debugKNorm / fromIntegral (V.length debugKNorm) :: Float
+            kNormStd = sqrt $ V.sum (V.map (\x -> (x - kNormMean) * (x - kNormMean)) debugKNorm) / fromIntegral (V.length debugKNorm) :: Float
+        debugPrint $ "  DEBUG [POS=" ++ show position ++ "] after Q QKNorm (BEFORE RoPE): mean=" ++ show qNormMean ++ ", std=" ++ show qNormStd ++ ", first_10: " ++ show (V.take 10 debugQNorm)
+        debugPrint $ "  DEBUG [POS=" ++ show position ++ "] after K QKNorm (BEFORE RoPE): mean=" ++ show kNormMean ++ ", std=" ++ show kNormStd ++ ", first_10: " ++ show (V.take 10 debugKNorm)
 
   -- Step 4: Apply RoPE (GPU) - writes to pre-allocated buffers
   runRoPEGPU ctx qNorm tlQRopeBuffer tlRoPEShader position ropeBase headDim qSize
@@ -194,9 +206,12 @@ runTransformerBlockCachedGPU ctx inputTensor layer cache position numHeads numKV
       waitAll ctx
       debugQRope <- T.fromGPU ctx qRope qSize :: IO (V.Vector Float)
       debugKRope <- T.fromGPU ctx kRope kvSize :: IO (V.Vector Float)
-      debugPrint $ "  DEBUG after RoPE Q (first 10): " ++ show (V.take 10 debugQRope)
-      debugPrint $ "  DEBUG after RoPE Q stats: min=" ++ show (V.minimum debugQRope :: Float) ++ " max=" ++ show (V.maximum debugQRope :: Float)
-      debugPrint $ "  DEBUG after RoPE K stats: min=" ++ show (V.minimum debugKRope :: Float) ++ " max=" ++ show (V.maximum debugKRope :: Float)
+      let qRopeMean = V.sum debugQRope / fromIntegral (V.length debugQRope) :: Float
+          qRopeStd = sqrt $ V.sum (V.map (\x -> (x - qRopeMean) * (x - qRopeMean)) debugQRope) / fromIntegral (V.length debugQRope) :: Float
+          kRopeMean = V.sum debugKRope / fromIntegral (V.length debugKRope) :: Float
+          kRopeStd = sqrt $ V.sum (V.map (\x -> (x - kRopeMean) * (x - kRopeMean)) debugKRope) / fromIntegral (V.length debugKRope) :: Float
+      debugPrint $ "  DEBUG [POS=" ++ show position ++ "] after RoPE Q: mean=" ++ show qRopeMean ++ ", std=" ++ show qRopeStd ++ ", first_10: " ++ show (V.take 10 debugQRope)
+      debugPrint $ "  DEBUG [POS=" ++ show position ++ "] after RoPE K: mean=" ++ show kRopeMean ++ ", std=" ++ show kRopeStd ++ ", first_10: " ++ show (V.take 10 debugKRope)
 
   -- Step 5: GPU-resident KV cache update (NO CPU TRANSFERS!)
   -- Append new K/V directly to GPU cache tensors in-place
@@ -254,8 +269,10 @@ runTransformerBlockCachedGPU ctx inputTensor layer cache position numHeads numKV
           debugPrint "  DEBUG: Attention scores completed"
           -- Check attention scores immediately
           waitAll ctx
-          debugScores <- T.fromGPU ctx tlScoresBuffer (numHeads * maxCacheLen) :: IO (V.Vector Float)
-          debugPrint $ "  DEBUG scores (first 10): " ++ show (V.take 10 debugScores)
+          debugScores <- T.fromGPU ctx tlScoresBuffer (numHeads * effectiveLen) :: IO (V.Vector Float)
+          let scoresMean = V.sum debugScores / fromIntegral (V.length debugScores) :: Float
+              scoresStd = sqrt $ V.sum (V.map (\x -> (x - scoresMean) * (x - scoresMean)) debugScores) / fromIntegral (V.length debugScores) :: Float
+          debugPrint $ "  DEBUG [POS=" ++ show position ++ "] attention scores (after softmax): mean=" ++ show scoresMean ++ ", std=" ++ show scoresStd ++ ", first_10: " ++ show (V.take 10 debugScores)
       let scoresTensor = tlScoresBuffer
 
       -- Step 7: Attention output (GPU) - writes to pre-allocated buffer
@@ -272,8 +289,9 @@ runTransformerBlockCachedGPU ctx inputTensor layer cache position numHeads numKV
           -- IMMEDIATELY check the attention output before it gets overwritten
           waitAll ctx
           debugAttnOutImmediate <- T.fromGPU ctx tlAttnOutBuffer qSize :: IO (V.Vector Float)
-          debugPrint $ "  DEBUG IMMEDIATE attnOut (first 10): " ++ show (V.take 10 debugAttnOutImmediate)
-          debugPrint $ "  DEBUG IMMEDIATE attnOut stats: min=" ++ show (V.minimum debugAttnOutImmediate :: Float) ++ " max=" ++ show (V.maximum debugAttnOutImmediate :: Float)
+          let attnOutMean = V.sum debugAttnOutImmediate / fromIntegral (V.length debugAttnOutImmediate) :: Float
+              attnOutStd = sqrt $ V.sum (V.map (\x -> (x - attnOutMean) * (x - attnOutMean)) debugAttnOutImmediate) / fromIntegral (V.length debugAttnOutImmediate) :: Float
+          debugPrint $ "  DEBUG [POS=" ++ show position ++ "] attention output (scores @ V): mean=" ++ show attnOutMean ++ ", std=" ++ show attnOutStd ++ ", first_10: " ++ show (V.take 10 debugAttnOutImmediate)
       pure ()
 
   let attnOutTensor = tlAttnOutBuffer

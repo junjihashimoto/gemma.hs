@@ -18,14 +18,22 @@ library
     Gemma.Model
     Gemma.KVCache
     Gemma.Layers.RMSNorm
+    Gemma.Layers.RMSNormDSL
+    Gemma.Layers.RoPEDSL
     Gemma.Layers.Linear
+    Gemma.Layers.LinearDSL
     Gemma.Layers.LinearQ4
+    Gemma.Layers.LinearQ4DSL
     Gemma.Layers.LinearQ4Fused
     Gemma.Layers.RoPE
     Gemma.Layers.Attention
     Gemma.Layers.AttentionCached
     Gemma.Layers.AttentionGPU
+    Gemma.Layers.AttentionDSL
     Gemma.Layers.MLP
+    Gemma.Layers.GELUDSL
+    Gemma.Layers.ElementwiseDSL
+    Gemma.Layers.SoftmaxDSL
     Gemma.Layers.Embedding
     Gemma.Layers.Scale
     Gemma.Layers.Convert
@@ -38,6 +46,7 @@ library
     Gemma.Tokenizer.BPE
     Gemma.Tokenizer.Decode
     Gemma.ChatTemplate
+    Gemma.Utils.Half
 
   hs-source-dirs:   src
   default-language: Haskell2010
@@ -61,7 +70,15 @@ test-suite gemma-test
   other-modules:
     Gemma.TestCache
     Gemma.Quantization.Q4Spec
+    Gemma.Layers.LinearDSLSpec
+    Gemma.Layers.AttentionDSLSpec
+    Gemma.Layers.RMSNormDSLSpec
+    Gemma.Layers.RoPEDSLSpec
+    Gemma.Layers.GELUDSLSpec
+    Gemma.Layers.ElementwiseDSLSpec
+    Gemma.Layers.SoftmaxDSLSpec
     Gemma.Layers.LinearQ4Spec
+    Gemma.Layers.LinearQ4DSLSpec
     Gemma.Layers.LinearQ4FusedSpec
     Gemma.Regression.FP32Spec
     Gemma.Regression.FP32InferenceSpec
@@ -71,6 +88,7 @@ test-suite gemma-test
     Gemma.Regression.Q4InferenceSpec
     Gemma.Regression.InferenceSpec
     Gemma.Regression.CompareWithOfficialSpec
+    Gemma.Regression.FirstTokenSpec
   hs-source-dirs:   test
   default-language: Haskell2010
   ghc-options:      -Wall -threaded -rtsopts -with-rtsopts=-N
@@ -112,6 +130,19 @@ executable show-configs
   build-depends:
     base >= 4.14 && < 5,
     gemma
+
+executable benchmark-linear-dsl
+  main-is:          benchmark-linear-dsl.hs
+  hs-source-dirs:   .
+  default-language: Haskell2010
+  ghc-options:      -Wall -threaded -rtsopts -with-rtsopts=-N -O2
+
+  build-depends:
+    base >= 4.14 && < 5,
+    gemma,
+    vector >= 0.12,
+    webgpu-dawn,
+    clock >= 0.8
 
 executable test-tokenizer-proto
   main-is:          TestTokenizerProto.hs

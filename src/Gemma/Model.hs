@@ -25,6 +25,7 @@ module Gemma.Model
   , loadGemmaModel
   , runGemmaInference
   , runGemmaInferenceCached
+  , runGemmaInferenceCachedWithLayer0  -- For TDD testing
   ) where
 
 import Graphics.WebGPU.Dawn.ContT
@@ -42,7 +43,7 @@ import Gemma.SafeTensors
 import Gemma.Layers.Embedding (runEmbedding, runEmbeddingGPU, embeddingShader)
 import Gemma.Layers.Scale (runScaleVectorGPU)
 import Gemma.Layers.RMSNorm (runRMSNormWithContext, runRMSNormGPU, runRMSNormPreloadedGPU, runRMSNormLinearFusedGPU, runRMSNormLinearFusedPreloadedGPU, rmsNormLinearFusedShader, rmsNormShader)
-import Gemma.Layers.Linear (runLinearWithContext, runLinearGPU, linearShader)
+import Gemma.Layers.LinearDSL (runLinearWithContext, runLinearGPU, linearShader)  -- Phase 4: Using DSL-based Linear instead of string-based Linear
 import Gemma.Layers.MLP (rmsNormGateUpFusedShader, geluMultiplyFusedShader, residualAddShader, ffnOutputFusedShader)
 import Gemma.Layers.AttentionGPU (qkvProjectionShader, qkNormShader, ropeShader, attentionScoresShader, attentionOutputShader, outputProjectionShader, appendKVCacheShader, attentionPostFusedShader, attentionCoreFusedShader)
 import Gemma.Layers.LinearQ4Fused (qkvProjectionQ4Shader, outputProjectionQ4Shader, rmsNormGateUpQ4Shader, rmsNormLinearQ4Shader,
@@ -217,7 +218,7 @@ gemma3_1BConfig = GemmaConfig
   -- Performance optimizations
   , gcUseFP16 = False  -- PRECISION ALIGNMENT: Match PyTorch FP32 reference (CLAUDE.md line 15)
   , gcUseVec4 = False  -- Requires FP16
-  , gcUseFusion = False  -- DISABLED: Test FP32 baseline without fusion first
+  , gcUseFusion = False  -- DISABLED: Test unfused path first to find Bug #2
   -- Gemma 3 features enabled
   , gcUseQKNorm = True          -- use_query_key_norm
   , gcUsePostAttnNorm = True    -- use_post_attention_norm
@@ -911,6 +912,9 @@ runGemmaInferenceCached model@GemmaModel{..} tokenIds mCache = evalContT $ do
         Nothing -> 0  -- First token
         Just c -> cacheLength (kvLayers c BV.! 0)  -- Position = cache length
 
+  -- DEBUG: Print position and cache state
+  liftIO $ putStrLn $ "🔍 Processing token at position " ++ show position ++ ", tokenId=" ++ show (V.head tokenIds)
+
   -- Step 1: Embed token using GPU-resident table and pre-compiled shader!
   -- No context creation, no table upload, no shader compilation!
   -- Using FP32 for embeddings until FP16 bug is fixed
@@ -935,17 +939,15 @@ runGemmaInferenceCached model@GemmaModel{..} tokenIds mCache = evalContT $ do
   let scaledEmbed = V.map (* embeddingScale) rawEmbedCPU
   hiddenTensor <- createTensorWithData gmContext (Shape [gcHiddenDim]) scaledEmbed
 
-  -- DEBUG: Check embedding output (only if DEBUG enabled)
+  -- DEBUG: Check embedding output (ALWAYS for debugging)
   liftIO $ do
-    debug <- lookupEnv "DEBUG"
-    when (debug == Just "1" || debug == Just "true") $ do
-      debugPrint $ "DEBUG: Token IDs being embedded: " ++ show tokenIds ++ " (length=" ++ show (V.length tokenIds) ++ ")"
-      debugPrint $ "DEBUG: hiddenDim=" ++ show gcHiddenDim
-      debugPrint $ "DEBUG: embeddingScale=" ++ show embeddingScale
-      waitAll gmContext
-      debugEmbed <- T.fromGPU gmContext hiddenTensor gcHiddenDim
-      debugPrint $ "DEBUG after embedding normalization (first 10): " ++ show (V.take 10 debugEmbed)
-      debugPrint $ "DEBUG after embedding normalization stats: min=" ++ show (V.minimum debugEmbed :: Float) ++ " max=" ++ show (V.maximum debugEmbed :: Float)
+    waitAll gmContext
+    debugEmbed <- T.fromGPU gmContext hiddenTensor gcHiddenDim :: IO (V.Vector Float)
+    let embMean :: Float
+        embMean = V.sum debugEmbed / fromIntegral (V.length debugEmbed)
+        embStd :: Float
+        embStd = sqrt $ V.sum (V.map (\x -> (x - embMean) * (x - embMean)) debugEmbed) / fromIntegral (V.length debugEmbed)
+    putStrLn $ "  📊 Embedding: mean=" ++ show embMean ++ ", std=" ++ show embStd ++ ", first5=" ++ show (V.take 5 debugEmbed)
 
   -- Step 2: Run through all transformer layers (FULLY GPU-RESIDENT with attention!)
   -- All intermediate tensors stay on GPU - NO downloads until the end!
@@ -976,20 +978,14 @@ runGemmaInferenceCached model@GemmaModel{..} tokenIds mCache = evalContT $ do
         ropeBase
         gcUseZeroCenteredRMSNorm
 
-      -- DEBUG: Check EVERY layer output to find where NaN first appears
-      liftIO $ do
-        debug <- lookupEnv "DEBUG"
-        when (debug == Just "1" || debug == Just "true") $ do
-          waitAll gmContext
-          debugLayer <- T.fromGPU gmContext hOutTensor gcHiddenDim
-          let hasNaN = V.any isNaN debugLayer
-              hasInf = V.any isInfinite debugLayer
-          when (hasNaN || hasInf || layerIdx == 0 || layerIdx == 1 || layerIdx == gcNumLayers - 1) $ do
-            debugPrint $ "DEBUG after layer " ++ show layerIdx ++ " (first 10): " ++ show (V.take 10 debugLayer)
-            debugPrint $ "DEBUG after layer " ++ show layerIdx ++ " stats: min=" ++ show (V.minimum debugLayer :: Float) ++ " max=" ++ show (V.maximum debugLayer :: Float)
-            when hasNaN $ debugPrint $ "❌ LAYER " ++ show layerIdx ++ " PRODUCED NaN!"
-            when hasInf $ debugPrint $ "⚠️  LAYER " ++ show layerIdx ++ " PRODUCED Inf!"
-            when (hasNaN && layerIdx > 0) $ debugPrint $ "   (Previous layer " ++ show (layerIdx - 1) ++ " was OK)"
+      -- DEBUG: Check layer 0 output
+      liftIO $ when (layerIdx == 0) $ do
+        -- ALWAYS print layer 0 for debugging
+        waitAll gmContext
+        debugLayer <- T.fromGPU gmContext hOutTensor gcHiddenDim :: IO (V.Vector Float)
+        let layerMean = V.sum debugLayer / fromIntegral (V.length debugLayer)
+            layerStd = sqrt $ V.sum (V.map (\x -> (x - layerMean) * (x - layerMean)) debugLayer) / fromIntegral (V.length debugLayer) :: Float
+        putStrLn $ "  📊 Layer 0: mean=" ++ show layerMean ++ ", std=" ++ show layerStd ++ ", first10=" ++ show (V.take 10 debugLayer)
 
       -- Update cache for this layer
       let newCacheLayers = kvLayers cacheLayers BV.// [(layerIdx, updatedLayerCache)]
@@ -1018,3 +1014,105 @@ runGemmaInferenceCached model@GemmaModel{..} tokenIds mCache = evalContT $ do
   logits <- liftIO $ T.fromGPU gmContext logitsTensor gcVocabSize
 
   return (logits, updatedCacheLayers)
+
+
+-- | Version of runGemmaInferenceCached that also returns Layer 0 output for TDD testing
+runGemmaInferenceCachedWithLayer0 :: GemmaModel dtype
+                                  -> V.Vector Int
+                                  -> Maybe KVCache
+                                  -> IO (V.Vector Float, KVCache, V.Vector Float)
+runGemmaInferenceCachedWithLayer0 model@GemmaModel{..} tokenIds mCache = evalContT $ do
+  let GemmaConfig{..} = gmConfig
+      seqLen = V.length tokenIds
+
+  -- Validate single token
+  if seqLen /= 1
+    then error $ "Cached inference requires single token, got " ++ show seqLen
+    else pure ()
+
+  -- Initialize cache if needed
+  let cache = case mCache of
+        Just c -> c
+        Nothing -> initKVCache gcNumLayers gcNumKVHeads gcHeadDim 2048
+
+      position = case mCache of
+        Nothing -> 0
+        Just c -> cacheLength (kvLayers c BV.! 0)
+
+  -- Step 1: Embed token
+  rawEmbedding <- runEmbeddingGPU gmContext tokenIds gmEmbeddingTensor gmEmbeddingShader False gcHiddenDim
+
+  -- DEBUG: Check raw embedding BEFORE scaling
+  liftIO $ do
+    debug <- lookupEnv "DEBUG"
+    when (debug == Just "1" || debug == Just "true") $ do
+      waitAll gmContext
+      debugRawEmbed <- T.fromGPU gmContext rawEmbedding gcHiddenDim
+      let rawMean = V.sum debugRawEmbed / fromIntegral (V.length debugRawEmbed) :: Float
+          rawStd = sqrt $ V.sum (V.map (\x -> (x - rawMean) * (x - rawMean)) debugRawEmbed) / fromIntegral (V.length debugRawEmbed) :: Float
+      debugPrint $ "DEBUG [Layer0WithCache] RAW embedding BEFORE scaling: mean=" ++ show rawMean ++ ", std=" ++ show rawStd ++ ", first_10=" ++ show (V.take 10 debugRawEmbed)
+
+  -- Step 1.5: Apply embedding normalization
+  let embeddingScale = sqrt (fromIntegral gcHiddenDim :: Float)
+  liftIO $ waitAll gmContext
+  rawEmbedCPU <- liftIO $ T.fromGPU gmContext rawEmbedding gcHiddenDim
+  let scaledEmbed = V.map (* embeddingScale) rawEmbedCPU
+
+  -- DEBUG: Check AFTER scaling
+  liftIO $ do
+    debug <- lookupEnv "DEBUG"
+    when (debug == Just "1" || debug == Just "true") $ do
+      let scaledMean = V.sum scaledEmbed / fromIntegral (V.length scaledEmbed) :: Float
+          scaledStd = sqrt $ V.sum (V.map (\x -> (x - scaledMean) * (x - scaledMean)) scaledEmbed) / fromIntegral (V.length scaledEmbed) :: Float
+      debugPrint $ "DEBUG [Layer0WithCache] AFTER scaling by sqrt(" ++ show gcHiddenDim ++ ")=" ++ show embeddingScale ++ ": mean=" ++ show scaledMean ++ ", std=" ++ show scaledStd ++ ", first_10=" ++ show (V.take 10 scaledEmbed)
+
+  hiddenTensor <- createTensorWithData gmContext (Shape [gcHiddenDim]) scaledEmbed
+
+  -- Step 2: Run through transformer layers and capture Layer 0 output
+  (finalHiddenTensor, updatedCacheLayers, layer0Output) <- foldM
+    (\(hTensor, cacheLayers, mLayer0) (layerIdx, layer) -> do
+      let layerCache = kvLayers cacheLayers BV.! layerIdx
+          currentCacheLen = cacheLength layerCache + 1
+          windowSize = if gcUseSlidingWindow
+                       then Just (min currentCacheLen gcSlidingWindowSize)
+                       else Nothing
+          ropeBase = gcRopeBase
+
+      -- Run transformer block
+      (hOutTensor, updatedLayerCache) <- runTransformerBlockCachedGPU
+        gmContext
+        hTensor
+        layer
+        layerCache
+        position
+        gcNumHeads
+        gcNumKVHeads
+        gcHeadDim
+        gcHiddenDim
+        gcFFNDim
+        windowSize
+        ropeBase
+        gcUseZeroCenteredRMSNorm
+
+      -- Capture Layer 0 output for TDD testing
+      layer0Vec <- if layerIdx == 0
+        then do
+          liftIO $ waitAll gmContext
+          liftIO $ T.fromGPU gmContext hOutTensor gcHiddenDim
+        else return mLayer0
+
+      -- Update cache for this layer
+      let newCacheLayers = kvLayers cacheLayers BV.// [(layerIdx, updatedLayerCache)]
+      return (hOutTensor, KVCache newCacheLayers, layer0Vec)
+    )
+    (hiddenTensor, cache, V.empty)
+    (zip [0..] gmLayers)
+
+  -- Step 3: Final RMSNorm + LM head
+  logitsTensor <- runRMSNormLinearFusedPreloadedGPU gmContext finalHiddenTensor gmFinalNormTensor gmLMHeadTensor gmFinalRMSNormLinearShader gcVocabSize
+
+  -- Step 4: Wait and download logits
+  liftIO $ waitAll gmContext
+  logits <- liftIO $ T.fromGPU gmContext logitsTensor gcVocabSize
+
+  return (logits, updatedCacheLayers, layer0Output)

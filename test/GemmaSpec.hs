@@ -21,6 +21,14 @@ import System.Directory (doesFileExist)
 import qualified Gemma.Quantization.Q4Spec as Q4Spec
 import qualified Gemma.Layers.LinearQ4Spec as LinearQ4Spec
 import qualified Gemma.Layers.LinearQ4FusedSpec as LinearQ4FusedSpec
+import qualified Gemma.Layers.LinearDSLSpec as LinearDSLSpec
+import qualified Gemma.Layers.AttentionDSLSpec as AttentionDSLSpec
+import qualified Gemma.Layers.RMSNormDSLSpec as RMSNormDSLSpec
+import qualified Gemma.Layers.RoPEDSLSpec as RoPEDSLSpec
+import qualified Gemma.Layers.GELUDSLSpec as GELUDSLSpec
+import qualified Gemma.Layers.ElementwiseDSLSpec as ElementwiseDSLSpec
+import qualified Gemma.Layers.SoftmaxDSLSpec as SoftmaxDSLSpec
+import qualified Gemma.Layers.LinearQ4DSLSpec as LinearQ4DSLSpec
 import qualified Gemma.Regression.FP32Spec as FP32Spec
 import qualified Gemma.Regression.FP16Spec as FP16Spec
 import qualified Gemma.Regression.AttentionSpec as AttentionSpec
@@ -30,10 +38,16 @@ import qualified Gemma.Regression.InferenceSpec as InferenceSpec
 import qualified Gemma.Regression.FP32InferenceSpec as FP32InferenceSpec
 import qualified Gemma.Regression.MultiTokenSpec as MultiTokenSpec
 import qualified Gemma.Regression.CompareWithOfficialSpec as CompareWithOfficialSpec
+import qualified Gemma.Regression.FirstTokenSpec as FirstTokenSpec
+import qualified Gemma.Regression.Layer0WithCacheSpec as Layer0WithCacheSpec
+import qualified Gemma.Regression.EmbeddingSpec as EmbeddingSpec
 
 -- | Main test suite entry point
 main :: IO ()
 main = hspec $ do
+  describe "Embedding Layer Comparison" EmbeddingSpec.spec
+  describe "First Token Generation (TDD PyTorch Comparison)" FirstTokenSpec.spec
+  describe "Layer 0 With KV Cache (TDD PyTorch Comparison)" Layer0WithCacheSpec.spec
   describe "Compare with Official Gemma 3" CompareWithOfficialSpec.spec
   describe "Multi-Token Inference (TDD)" MultiTokenSpec.spec
   describe "FP32 Single Token Inference (TDD)" FP32InferenceSpec.spec
@@ -46,6 +60,14 @@ main = hspec $ do
   describe "Q4 Quantization" Q4Spec.spec
   describe "Q4 Linear Layer" LinearQ4Spec.spec
   describe "Q4 Fused Layers" LinearQ4FusedSpec.spec
+  describe "Linear DSL Layer" LinearDSLSpec.spec
+  describe "Attention DSL Layer" AttentionDSLSpec.spec
+  describe "RMSNorm DSL Layer" RMSNormDSLSpec.spec
+  describe "RoPE DSL Layer" RoPEDSLSpec.spec
+  describe "GELU DSL Layer" GELUDSLSpec.spec
+  describe "Elementwise DSL Layer" ElementwiseDSLSpec.spec
+  describe "Softmax DSL Layer" SoftmaxDSLSpec.spec
+  describe "Linear Q4 DSL Layer" LinearQ4DSLSpec.spec
   describe "SafeTensors" safeTensorsSpec
   describe "Embedding" embeddingSpec
   describe "RMSNorm" rmsNormSpec

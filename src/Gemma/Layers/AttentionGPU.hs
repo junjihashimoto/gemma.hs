@@ -89,24 +89,27 @@ ropeShader useFP16 numHeads headDim ropeBase =
   , ""
   , "  let pos = position[0];"
   , "  let head_offset = head_idx * HEAD_DIM;"
+  , "  let half_dim = HEAD_DIM / 2u;"
   , ""
-  , "  // Apply rotation for each pair of dimensions"
-  , "  for (var i: u32 = 0u; i < HEAD_DIM; i = i + 2u) {"
+  , "  // Gemma 3 uses split-half RoPE: pair input[i] with input[i + half_dim]"
+  , "  for (var i: u32 = 0u; i < half_dim; i = i + 1u) {"
   , "    let idx = head_offset + i;"
+  , "    let idx_plus_half = idx + half_dim;"
   , "    let x = input[idx];"
-  , "    let y = input[idx + 1u];"
+  , "    let y = input[idx_plus_half];"
   , ""
   , "    // Calculate rotation angle"
-  , "    let freq_exp = " ++ floatType ++ "(i) / " ++ floatType ++ "(HEAD_DIM);"
+  , "    // Note: i goes 0,1,2,... so multiply by 2 to get pair indices 0,2,4,..."
+  , "    let freq_exp = " ++ floatType ++ "(i * 2u) / " ++ floatType ++ "(HEAD_DIM);"
   , "    let freq = 1.0" ++ floatLit ++ " / pow(ROPE_BASE, freq_exp);"
   , "    let theta = pos * freq;"
   , ""
-  , "    // Apply rotation matrix"
+  , "    // Apply split-half rotation matrix (matching PyTorch Gemma 3)"
   , "    let cos_theta = cos(theta);"
   , "    let sin_theta = sin(theta);"
   , ""
   , "    output[idx] = x * cos_theta - y * sin_theta;"
-  , "    output[idx + 1u] = x * sin_theta + y * cos_theta;"
+  , "    output[idx_plus_half] = x * sin_theta + y * cos_theta;"
   , "  }"
   , "}"
   ]
@@ -270,19 +273,13 @@ runAttentionScoresGPU :: Context
                       -> Int           -- maxCacheLen (for pre-compiled shader)
                       -> ContT r IO ()
 runAttentionScoresGPU ctx qTensor kCacheTensor scoresTensor code numHeads numKVHeads headDim cacheLen windowSize maxCacheLen = do
-  -- Create window size tensor (small, unavoidable)
-  let windowVal = case windowSize of
-        Just w -> fromIntegral w :: Float
-        Nothing -> fromIntegral cacheLen  -- No windowing
+  -- BUG FIX: Use cacheLen directly (it's already effectiveLen = min(cacheLen', windowSize))
+  -- The caller (TransformerBlock) already computed the window, don't re-apply it!
+  let windowVal = fromIntegral cacheLen :: Float
       windowShape = Shape [1]
       windowData = V.singleton windowVal
-  -- DEBUG: Print window value
-  liftIO $ do
-    debug <- lookupEnv "DEBUG"
-    case debug of
-      Just "1" -> putStrLn $ "  DEBUG runAttentionScoresGPU: windowVal=" ++ show windowVal ++ ", cacheLen=" ++ show cacheLen
-      Just "true" -> putStrLn $ "  DEBUG runAttentionScoresGPU: windowVal=" ++ show windowVal ++ ", cacheLen=" ++ show cacheLen
-      _ -> return ()
+  -- DEBUG: Print window value (ALWAYS for debugging Bug #2 fix)
+  liftIO $ putStrLn $ "  🐛 BUG#2 FIX ACTIVE: windowVal=" ++ show windowVal ++ " (was using windowSize=" ++ show windowSize ++ " before fix)"
   windowTensor <- createTensorWithData ctx windowShape windowData
 
   -- Dispatch kernel with pre-allocated scores buffer
@@ -569,15 +566,16 @@ attentionCoreFusedShader useFP16 numHeads numKVHeads headDim cacheLen windowSize
   , "@group(0) @binding(1) var<storage, read_write> k_cache: array<" ++ floatType ++ ">;"
   , "@group(0) @binding(2) var<storage, read_write> v_cache: array<" ++ floatType ++ ">;"
   , "@group(0) @binding(3) var<storage, read_write> output: array<" ++ floatType ++ ">;"
+  , "@group(0) @binding(4) var<storage, read_write> window_size: array<" ++ floatType ++ ">;"  -- FIX: Dynamic cache length
   , ""
   , "const NUM_HEADS: u32 = " ++ show numHeads ++ "u;"
   , "const NUM_KV_HEADS: u32 = " ++ show numKVHeads ++ "u;"
   , "const HEAD_DIM: u32 = " ++ show headDim ++ "u;"
-  , "const CACHE_LEN: u32 = " ++ show window ++ "u;"
+  , "const MAX_CACHE_LEN: u32 = " ++ show maxCacheLen ++ "u;"  -- FIX: Renamed to MAX_CACHE_LEN for clarity
   , "const SCALE: " ++ floatType ++ " = " ++ show (1.0 / sqrt (fromIntegral headDim :: Float)) ++ floatLit ++ ";"
   , ""
   , "// Workgroup shared memory for scores (avoids global memory!)"
-  , "var<workgroup> scores: array<" ++ floatType ++ ", " ++ show window ++ ">;"
+  , "var<workgroup> scores: array<" ++ floatType ++ ", " ++ show maxCacheLen ++ ">;"  -- FIX: Use MAX_CACHE_LEN for array size
   , ""
   , "@compute @workgroup_size(256)"
   , "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {"
@@ -588,9 +586,11 @@ attentionCoreFusedShader useFP16 numHeads numKVHeads headDim cacheLen windowSize
   , "  let kv_head_idx = head_idx / (NUM_HEADS / NUM_KV_HEADS);"
   , "  let q_offset = head_idx * HEAD_DIM;"
   , ""
+  , "  let window = u32(window_size[0]);"  -- FIX: Read dynamic window size
+  , ""
   , "  // STEP 1: Compute Q @ K^T (attention scores)"
   , "  var max_score: " ++ floatType ++ " = -1e9" ++ floatLit ++ ";"
-  , "  for (var pos: u32 = 0u; pos < CACHE_LEN; pos++) {"
+  , "  for (var pos: u32 = 0u; pos < window; pos++) {"  -- FIX: Use dynamic window
   , "    let k_offset = pos * NUM_KV_HEADS * HEAD_DIM + kv_head_idx * HEAD_DIM;"
   , "    var dot: " ++ floatType ++ " = 0.0" ++ floatLit ++ ";"
   , "    for (var i: u32 = 0u; i < HEAD_DIM; i++) {"
@@ -603,12 +603,12 @@ attentionCoreFusedShader useFP16 numHeads numKVHeads headDim cacheLen windowSize
   , ""
   , "  // STEP 2: Softmax normalization (exp and normalize)"
   , "  var sum_exp: " ++ floatType ++ " = 0.0" ++ floatLit ++ ";"
-  , "  for (var pos: u32 = 0u; pos < CACHE_LEN; pos++) {"
+  , "  for (var pos: u32 = 0u; pos < window; pos++) {"  -- FIX: Use dynamic window
   , "    let exp_val = exp(scores[pos] - max_score);"
   , "    scores[pos] = exp_val;  // Update in-place!"
   , "    sum_exp += exp_val;"
   , "  }"
-  , "  for (var pos: u32 = 0u; pos < CACHE_LEN; pos++) {"
+  , "  for (var pos: u32 = 0u; pos < window; pos++) {"  -- FIX: Use dynamic window
   , "    scores[pos] /= sum_exp;  // Normalize in-place!"
   , "  }"
   , ""
@@ -616,7 +616,7 @@ attentionCoreFusedShader useFP16 numHeads numKVHeads headDim cacheLen windowSize
   , "  let out_offset = head_idx * HEAD_DIM;"
   , "  for (var d: u32 = 0u; d < HEAD_DIM; d++) {"
   , "    var sum: " ++ floatType ++ " = 0.0" ++ floatLit ++ ";"
-  , "    for (var pos: u32 = 0u; pos < CACHE_LEN; pos++) {"
+  , "    for (var pos: u32 = 0u; pos < window; pos++) {"  -- FIX: Use dynamic window
   , "      let v_offset = pos * NUM_KV_HEADS * HEAD_DIM + kv_head_idx * HEAD_DIM;"
   , "      sum += scores[pos] * v_cache[v_offset + d];  // Read from shared memory!"
   , "    }"
@@ -646,8 +646,15 @@ runAttentionCoreFusedPreloadedGPU :: Context
                                   -> Int           -- maxCacheLen
                                   -> ContT r IO ()
 runAttentionCoreFusedPreloadedGPU ctx qTensor kCacheTensor vCacheTensor outputTensor code numHeads numKVHeads headDim cacheLen windowSize maxCacheLen = do
+  -- BUG FIX: Use cacheLen directly (it's already effectiveLen = min(cacheLen', windowSize))
+  -- The caller (TransformerBlock) already computed the window, don't re-apply it!
+  let windowVal = fromIntegral cacheLen :: Float
+      windowShape = Shape [1]
+      windowData = V.singleton windowVal
+  windowTensor <- createTensorWithData ctx windowShape windowData
+
   let numWorkgroups = (numHeads + 255) `div` 256
-  kernel <- createKernel ctx code [qTensor, kCacheTensor, vCacheTensor, outputTensor]
+  kernel <- createKernel ctx code [qTensor, kCacheTensor, vCacheTensor, outputTensor, windowTensor]  -- FIX: Added windowTensor
             (WorkgroupSize numWorkgroups 1 1)
   liftIO $ dispatchKernelAsync ctx kernel
 
