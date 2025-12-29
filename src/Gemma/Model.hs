@@ -23,6 +23,8 @@ module Gemma.Model
   , gemma3_1BConfig
   , tinyGemmaConfig
   , loadGemmaModel
+  , loadGemmaModelFromGGUF  -- Load from GGUF format
+  , configFromGGUF          -- Extract config from GGUF metadata
   , runGemmaInference
   , runGemmaInferenceCached
   , runGemmaInferenceCachedWithLayer0  -- For TDD testing
@@ -34,12 +36,15 @@ import qualified Graphics.WebGPU.Dawn.Context as Ctx
 import qualified Data.Vector.Storable as V
 import Data.Vector.Storable (Vector)
 import Control.Monad (forM, foldM, when)
+import qualified Control.Exception
 import Data.Int (Int32)
 import qualified Data.Text as T
 import Data.Text (Text)
 import System.Environment (lookupEnv)
 
 import Gemma.SafeTensors
+import qualified Gemma.GGUF as GGUF
+import Gemma.GGUF (GGUFFile, getMetadata, MetadataValue(..), GGMLType(..))
 import Gemma.Layers.Embedding (runEmbedding, runEmbeddingGPU, embeddingShader)
 import Gemma.Layers.Scale (runScaleVectorGPU)
 import Gemma.Layers.RMSNorm (runRMSNormWithContext, runRMSNormGPU, runRMSNormPreloadedGPU, runRMSNormLinearFusedGPU, runRMSNormLinearFusedPreloadedGPU, rmsNormLinearFusedShader, rmsNormShader)
@@ -327,8 +332,11 @@ loadGemmaModel modelPath config = do
                                pure (fp32, Nothing)
 
     -- Pre-feedforward norm (Gemma 3)
-    -- PyTorch uses pre_feedforward_layernorm for PRE-FFN norm (before MLP)
-    ffnNorm <- getTensor st (prefix <> ".pre_feedforward_layernorm.weight")
+    -- Newer models: pre_feedforward_layernorm.weight
+    -- Older models: post_attention_layernorm.weight (misleading name, but it IS the pre-FFN norm!)
+    ffnNorm <- if hasTensor st (prefix <> ".pre_feedforward_layernorm.weight")
+               then getTensor st (prefix <> ".pre_feedforward_layernorm.weight")
+               else getTensor st (prefix <> ".post_attention_layernorm.weight")
 
     let gateName = prefix <> ".mlp.gate_proj.weight"
         upName = prefix <> ".mlp.up_proj.weight"
@@ -807,6 +815,106 @@ loadGemmaModel modelPath config = do
     , gmEmbeddingShader = embeddingShader'
     , gmFinalRMSNormLinearShader = finalRMSNormLinearShader
     }
+
+-- | Extract GemmaConfig from GGUF metadata
+--
+-- Reads GGUF metadata and constructs a GemmaConfig with appropriate settings
+-- for Gemma 3 models. Uses metadata keys like gemma3.block_count, gemma3.embedding_length, etc.
+configFromGGUF :: GGUFFile -> GemmaConfig
+configFromGGUF gf =
+  let getInt key = case getMetadata gf key of
+                     Just (MetaInt32 n) -> fromIntegral n
+                     Just (MetaUInt32 n) -> fromIntegral n
+                     Just (MetaInt64 n) -> fromIntegral n
+                     Just (MetaUInt64 n) -> fromIntegral n
+                     _ -> error $ "Missing or invalid metadata: " ++ T.unpack key
+
+      getFloat key = case getMetadata gf key of
+                       Just (MetaFloat32 f) -> realToFrac f
+                       Just (MetaFloat64 d) -> realToFrac d
+                       _ -> error $ "Missing or invalid metadata: " ++ T.unpack key
+
+      -- Extract core configuration
+      blockCount = getInt "gemma3.block_count"
+      embeddingLength = getInt "gemma3.embedding_length"
+      ffnLength = getInt "gemma3.feed_forward_length"
+      headCount = getInt "gemma3.attention.head_count"
+      kvHeadCount = getInt "gemma3.attention.head_count_kv"
+      headDim = getInt "gemma3.attention.key_length"
+      ropeFreqBase = getFloat "gemma3.rope.freq_base"
+
+      -- Get vocab size from token array length
+      vocabSize = case getMetadata gf "tokenizer.ggml.tokens" of
+                    Just (MetaArray arr) -> length arr
+                    _ -> error "Missing tokenizer.ggml.tokens"
+
+      -- Optional parameters with defaults
+      slidingWindow = case getMetadata gf "gemma3.attention.sliding_window" of
+                        Just (MetaInt32 n) -> fromIntegral n
+                        Just (MetaUInt32 n) -> fromIntegral n
+                        _ -> 512  -- Default
+  in
+    GemmaConfig
+      { gcVocabSize = vocabSize
+      , gcHiddenDim = embeddingLength
+      , gcNumLayers = blockCount
+      , gcNumHeads = headCount
+      , gcNumKVHeads = kvHeadCount
+      , gcHeadDim = headDim
+      , gcFFNDim = ffnLength
+      , gcRopeBase = ropeFreqBase
+      -- GGUF models are typically quantized, so use FP16 precision
+      , gcUseFP16 = False  -- Start with FP32 for correctness, optimize later
+      , gcUseVec4 = False
+      , gcUseFusion = False
+      -- Gemma 3 features (always enabled for GGUF Gemma 3 models)
+      , gcUseQKNorm = True
+      , gcUsePostAttnNorm = True
+      , gcUsePostFFNNorm = True
+      , gcUseSlidingWindow = True
+      , gcSlidingWindowSize = slidingWindow
+      , gcLocalRopeScaling = 1.0
+      , gcGlobalRopeScaling = 1.0
+      , gcQueryHeadDimNormalize = True
+      , gcUseZeroCenteredRMSNorm = True
+      }
+
+-- | Load Gemma model from GGUF file
+--
+-- Loads a quantized GGUF model and converts it to GemmaModel format.
+--
+-- **Note**: This is a simplified implementation that currently has limitations:
+-- 1. Q4 quantization is not yet implemented (requires Q4 support)
+-- 2. We don't yet map all GGUF tensor names to the Gemma naming convention
+-- 3. The full layer construction logic is complex and needs to match loadGemmaModel
+--
+-- For now, this function demonstrates the structure but will need Q4 support
+-- and complete layer construction to work fully.
+loadGemmaModelFromGGUF :: FilePath -> IO (GemmaModel dtype)
+loadGemmaModelFromGGUF ggufPath = do
+  putStrLn $ "⚠️  GGUF model loading is partially implemented"
+  putStrLn $ "Loading GGUF file for inspection: " ++ ggufPath
+
+  -- Load GGUF file
+  gf <- GGUF.loadGGUF ggufPath
+
+  -- Extract configuration
+  let config = configFromGGUF gf
+  putStrLn "✅ Configuration extracted from GGUF metadata:"
+  putStrLn $ "  Vocab size: " ++ show (gcVocabSize config)
+  putStrLn $ "  Hidden dim: " ++ show (gcHiddenDim config)
+  putStrLn $ "  Num layers: " ++ show (gcNumLayers config)
+  putStrLn $ "  Num heads: " ++ show (gcNumHeads config) ++ " (KV: " ++ show (gcNumKVHeads config) ++ ")"
+  putStrLn $ "  FFN dim: " ++ show (gcFFNDim config)
+  putStrLn $ "  RoPE base: " ++ show (gcRopeBase config)
+  putStrLn ""
+  putStrLn "❌ Full GGUF model loading not yet implemented"
+  putStrLn "TODO: Need to:"
+  putStrLn "  1. Implement Q4 dequantization"
+  putStrLn "  2. Map GGUF tensor names to Gemma format"
+  putStrLn "  3. Complete full layer construction with all buffers"
+  putStrLn ""
+  error "GGUF model loading not yet fully implemented - use SafeTensors format for now"
 
 -- | Run inference on Gemma model
 --

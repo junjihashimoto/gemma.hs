@@ -29,6 +29,7 @@ import qualified Gemma.Layers.GELUDSLSpec as GELUDSLSpec
 import qualified Gemma.Layers.ElementwiseDSLSpec as ElementwiseDSLSpec
 import qualified Gemma.Layers.SoftmaxDSLSpec as SoftmaxDSLSpec
 import qualified Gemma.Layers.LinearQ4DSLSpec as LinearQ4DSLSpec
+import qualified Gemma.Layers.DequantQ4GGUFSpec as DequantQ4GGUFSpec
 import qualified Gemma.Regression.FP32Spec as FP32Spec
 import qualified Gemma.Regression.FP16Spec as FP16Spec
 import qualified Gemma.Regression.AttentionSpec as AttentionSpec
@@ -70,6 +71,7 @@ main = hspec $ do
   describe "Elementwise DSL Layer" ElementwiseDSLSpec.spec
   describe "Softmax DSL Layer" SoftmaxDSLSpec.spec
   describe "Linear Q4 DSL Layer" LinearQ4DSLSpec.spec
+  describe "Q4_0 GGUF Dequantization" DequantQ4GGUFSpec.spec
   describe "SafeTensors" safeTensorsSpec
   describe "Embedding" embeddingSpec
   describe "RMSNorm" rmsNormSpec

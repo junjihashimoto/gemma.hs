@@ -29,6 +29,7 @@ import Gemma.Model
 import Gemma.Tokenizer
 import Gemma.ChatTemplate
 import Gemma.SafeTensors (loadSafeTensors, hasTensor)
+import System.FilePath (takeExtension)
 
 main :: IO ()
 main = do
@@ -37,24 +38,40 @@ main = do
     ["--help"] -> printHelp
     ["--test", modelPath] -> runTest modelPath
     ["--model", modelPath, "--tokenizer", tokPath, "--prompt", prompt] ->
-      runSinglePrompt modelPath tokPath prompt
+      runSinglePrompt modelPath (Just tokPath) prompt
     ["--model", modelPath, "--tokenizer", tokPath, "--chat"] ->
-      runInteractiveChat modelPath tokPath
+      runInteractiveChat modelPath (Just tokPath)
+    -- GGUF models have embedded tokenizer
+    ["--model", modelPath, "--prompt", prompt] | isGGUF modelPath ->
+      runSinglePrompt modelPath Nothing prompt
+    ["--model", modelPath, "--chat"] | isGGUF modelPath ->
+      runInteractiveChat modelPath Nothing
     _ -> do
       putStrLn "❌ Invalid arguments. Use --help for usage information."
       exitFailure
+  where
+    isGGUF path = takeExtension path == ".gguf"
 
 printHelp :: IO ()
 printHelp = do
   putStrLn "Gemma Inference CLI"
   putStrLn ""
   putStrLn "Usage:"
-  putStrLn "  gemma-cli --model <path> --tokenizer <path> --prompt <text>"
+  putStrLn "  # SafeTensors models (require separate tokenizer):"
+  putStrLn "  gemma-cli --model <path.safetensors> --tokenizer <path> --prompt <text>"
   putStrLn "      Run single inference"
   putStrLn ""
-  putStrLn "  gemma-cli --model <path> --tokenizer <path> --chat"
+  putStrLn "  gemma-cli --model <path.safetensors> --tokenizer <path> --chat"
   putStrLn "      Interactive chat mode"
   putStrLn ""
+  putStrLn "  # GGUF models (embedded tokenizer):"
+  putStrLn "  gemma-cli --model <path.gguf> --prompt <text>"
+  putStrLn "      Run single inference with GGUF model"
+  putStrLn ""
+  putStrLn "  gemma-cli --model <path.gguf> --chat"
+  putStrLn "      Interactive chat mode with GGUF model"
+  putStrLn ""
+  putStrLn "  # Testing:"
   putStrLn "  gemma-cli --test <path>"
   putStrLn "      Run simple test (no tokenizer needed)"
   putStrLn ""
@@ -62,13 +79,13 @@ printHelp = do
   putStrLn "      Show this help"
   putStrLn ""
   putStrLn "Examples:"
-  putStrLn "  gemma-cli --model models/gemma-2-2b/model.safetensors \\"
-  putStrLn "            --tokenizer models/gemma3-keras-gemma3_1b-v3/assets/tokenizer/vocabulary.spm \\"
-  putStrLn "            --prompt \"What is the capital of France?\""
-  putStrLn ""
-  putStrLn "  gemma-cli --model models/gemma-2-2b/model.safetensors \\"
-  putStrLn "            --tokenizer models/gemma3-keras-gemma3_1b-v3/assets/tokenizer/vocabulary.spm \\"
+  putStrLn "  # SafeTensors:"
+  putStrLn "  gemma-cli --model models/gemma-3-1b/model.safetensors \\"
+  putStrLn "            --tokenizer models/gemma-3-1b/tokenizer.model \\"
   putStrLn "            --chat"
+  putStrLn ""
+  putStrLn "  # GGUF (quantized):"
+  putStrLn "  gemma-cli --model models/gemma-3-1b-it-q4_0.gguf --chat"
 
 -- | Test mode - just load model and run single token inference
 runTest :: FilePath -> IO ()
@@ -164,74 +181,143 @@ autoDetectConfig modelPath vSize = do
     }
 
 -- | Run inference on a single prompt
-runSinglePrompt :: FilePath -> FilePath -> String -> IO ()
-runSinglePrompt modelPath tokPath prompt = do
+runSinglePrompt :: FilePath -> Maybe FilePath -> String -> IO ()
+runSinglePrompt modelPath mbTokPath prompt = do
   putStrLn "🤖 Gemma Inference"
   putStrLn $ "📁 Model: " ++ modelPath
-  putStrLn $ "📝 Tokenizer: " ++ tokPath
+  case mbTokPath of
+    Just tokPath -> putStrLn $ "📝 Tokenizer: " ++ tokPath
+    Nothing -> putStrLn "📝 Tokenizer: (embedded in GGUF)"
   putStrLn $ "💬 Prompt: " ++ prompt
   putStrLn ""
 
-  -- Load tokenizer
-  putStrLn "📦 Loading tokenizer..."
-  tokenizer <- loadTokenizer tokPath
-  let template = buildChatTemplate tokenizer
-  putStrLn "✅ Tokenizer loaded"
+  -- Check if GGUF model
+  let isGGUF = takeExtension modelPath == ".gguf"
 
-  -- Load model with auto-detected config
-  putStrLn "📦 Detecting model configuration..."
-  let vSize = vocabSize tokenizer
-  putStrLn $ "  Vocab size: " ++ show vSize
-  putStrLn $ "  Base config: " ++ (if vSize > 260000 then "Gemma 3 1B" else "Gemma 2 2B")
+  if isGGUF
+    then do
+      -- GGUF path: Load model from GGUF (tokenizer embedded)
+      putStrLn "📦 Loading GGUF model (this may take a while)..."
+      model <- loadGemmaModelFromGGUF modelPath
+      putStrLn "✅ Model loaded"
 
-  config <- autoDetectConfig modelPath vSize
+      -- For now, still require separate tokenizer
+      -- TODO: Extract tokenizer from GGUF metadata
+      case mbTokPath of
+        Just tokPath -> do
+          tokenizer <- loadTokenizer tokPath
+          let template = buildChatTemplate tokenizer
+          response <- generateResponse model tokenizer template [(True, T.pack prompt)] 100
+          putStrLn "🎯 Response:"
+          TIO.putStrLn response
+        Nothing -> do
+          putStrLn "⚠️  GGUF tokenizer extraction not yet implemented"
+          putStrLn "Please provide --tokenizer for now:"
+          putStrLn "  gemma-cli --model model.gguf --tokenizer tokenizer.model --prompt \"...\""
+          exitFailure
+    else do
+      -- SafeTensors path: Require tokenizer
+      tokPath <- case mbTokPath of
+                   Just path -> pure path
+                   Nothing -> do
+                     putStrLn "❌ SafeTensors models require --tokenizer argument"
+                     exitFailure
 
-  putStrLn "📦 Loading model..."
-  model <- loadGemmaModel modelPath config
-  putStrLn "✅ Model loaded"
-  putStrLn ""
+      -- Load tokenizer
+      putStrLn "📦 Loading tokenizer..."
+      tokenizer <- loadTokenizer tokPath
+      let template = buildChatTemplate tokenizer
+      putStrLn "✅ Tokenizer loaded"
 
-  -- Generate response (single user turn)
-  response <- generateResponse model tokenizer template [(True, T.pack prompt)] 100
+      -- Load model with auto-detected config
+      putStrLn "📦 Detecting model configuration..."
+      let vSize = vocabSize tokenizer
+      putStrLn $ "  Vocab size: " ++ show vSize
+      putStrLn $ "  Base config: " ++ (if vSize > 260000 then "Gemma 3 1B" else "Gemma 2 2B")
 
-  putStrLn "🎯 Response:"
-  TIO.putStrLn response
+      config <- autoDetectConfig modelPath vSize
+
+      putStrLn "📦 Loading model..."
+      model <- loadGemmaModel modelPath config
+      putStrLn "✅ Model loaded"
+      putStrLn ""
+
+      -- Generate response (single user turn)
+      response <- generateResponse model tokenizer template [(True, T.pack prompt)] 100
+
+      putStrLn "🎯 Response:"
+      TIO.putStrLn response
 
 -- | Run interactive chat mode
-runInteractiveChat :: FilePath -> FilePath -> IO ()
-runInteractiveChat modelPath tokPath = do
+runInteractiveChat :: FilePath -> Maybe FilePath -> IO ()
+runInteractiveChat modelPath mbTokPath = do
   putStrLn "🤖 Gemma Interactive Chat"
   putStrLn "================================"
   putStrLn ""
   putStrLn $ "📁 Model: " ++ modelPath
-  putStrLn $ "📝 Tokenizer: " ++ tokPath
+  case mbTokPath of
+    Just tokPath -> putStrLn $ "📝 Tokenizer: " ++ tokPath
+    Nothing -> putStrLn "📝 Tokenizer: (embedded in GGUF)"
   putStrLn ""
 
-  -- Load tokenizer
-  putStrLn "📦 Loading tokenizer..."
-  tokenizer <- loadTokenizer tokPath
-  let template = buildChatTemplate tokenizer
-  putStrLn "✅ Tokenizer loaded"
+  -- Check if GGUF model
+  let isGGUF = takeExtension modelPath == ".gguf"
 
-  -- Load model with auto-detected config
-  putStrLn "📦 Detecting model configuration..."
-  let vSize = vocabSize tokenizer
-  putStrLn $ "  Vocab size: " ++ show vSize
-  putStrLn $ "  Base config: " ++ (if vSize > 260000 then "Gemma 3 1B" else "Gemma 2 2B")
+  if isGGUF
+    then do
+      -- GGUF path: Load model from GGUF
+      putStrLn "📦 Loading GGUF model (this may take a while)..."
+      model <- loadGemmaModelFromGGUF modelPath
+      putStrLn "✅ Model loaded"
 
-  config <- autoDetectConfig modelPath vSize
+      -- For now, still require separate tokenizer
+      case mbTokPath of
+        Just tokPath -> do
+          tokenizer <- loadTokenizer tokPath
+          let template = buildChatTemplate tokenizer
+          putStrLn ""
+          putStrLn "Type 'exit' or 'quit' to end the conversation"
+          putStrLn "================================"
+          putStrLn ""
+          chatLoop model tokenizer template []
+        Nothing -> do
+          putStrLn "⚠️  GGUF tokenizer extraction not yet implemented"
+          putStrLn "Please provide --tokenizer for now:"
+          putStrLn "  gemma-cli --model model.gguf --tokenizer tokenizer.model --chat"
+          exitFailure
+    else do
+      -- SafeTensors path
+      tokPath <- case mbTokPath of
+                   Just path -> pure path
+                   Nothing -> do
+                     putStrLn "❌ SafeTensors models require --tokenizer argument"
+                     exitFailure
 
-  putStrLn "📦 Loading model..."
-  model <- loadGemmaModel modelPath config
-  putStrLn "✅ Model loaded"
-  putStrLn ""
+      -- Load tokenizer
+      putStrLn "📦 Loading tokenizer..."
+      tokenizer <- loadTokenizer tokPath
+      let template = buildChatTemplate tokenizer
+      putStrLn "✅ Tokenizer loaded"
 
-  putStrLn "Type 'exit' or 'quit' to end the conversation"
-  putStrLn "================================"
-  putStrLn ""
+      -- Load model with auto-detected config
+      putStrLn "📦 Detecting model configuration..."
+      let vSize = vocabSize tokenizer
+      putStrLn $ "  Vocab size: " ++ show vSize
+      putStrLn $ "  Base config: " ++ (if vSize > 260000 then "Gemma 3 1B" else "Gemma 2 2B")
 
-  -- Start chat loop
-  chatLoop model tokenizer template []
+      config <- autoDetectConfig modelPath vSize
+
+      putStrLn "📦 Loading model..."
+      model <- loadGemmaModel modelPath config
+      putStrLn "✅ Model loaded"
+      putStrLn ""
+
+      putStrLn "Type 'exit' or 'quit' to end the conversation"
+      putStrLn "================================"
+      putStrLn ""
+
+      -- Start chat loop
+      chatLoop model tokenizer template []
 
 -- | Interactive chat loop
 chatLoop :: forall dtype. GemmaModel dtype -> Tokenizer -> ChatTemplate -> [(Bool, T.Text)] -> IO ()
