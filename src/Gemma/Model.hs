@@ -220,9 +220,9 @@ gemma3_1BConfig = GemmaConfig
   , gcUseVec4 = False  -- Requires FP16
   , gcUseFusion = False  -- DISABLED: Test unfused path first to find Bug #2
   -- Gemma 3 features enabled
-  , gcUseQKNorm = True          -- use_query_key_norm
-  , gcUsePostAttnNorm = True    -- use_post_attention_norm
-  , gcUsePostFFNNorm = True     -- use_post_ffw_norm
+  , gcUseQKNorm = True          -- use_query_key_norm (Q/K normalization)
+  , gcUsePostAttnNorm = True    -- POST-attention norm (after attention, before residual)
+  , gcUsePostFFNNorm = True     -- POST-FFN norm (after MLP, before residual)
   , gcUseSlidingWindow = True   -- use_sliding_window_attention
   , gcSlidingWindowSize = 512   -- sliding_window_size
   , gcLocalRopeScaling = 1.0    -- local_rope_scaling_factor
@@ -326,10 +326,9 @@ loadGemmaModel modelPath config = do
                                fp32 <- getTensor st outName
                                pure (fp32, Nothing)
 
-    -- Pre-feedforward norm (Gemma 3: pre_feedforward_layernorm, older: post_attention_layernorm)
-    ffnNorm <- if hasTensor st (prefix <> ".pre_feedforward_layernorm.weight")
-               then getTensor st (prefix <> ".pre_feedforward_layernorm.weight")
-               else getTensor st (prefix <> ".post_attention_layernorm.weight")  -- Fallback for older models
+    -- Pre-feedforward norm (Gemma 3)
+    -- PyTorch uses pre_feedforward_layernorm for PRE-FFN norm (before MLP)
+    ffnNorm <- getTensor st (prefix <> ".pre_feedforward_layernorm.weight")
 
     let gateName = prefix <> ".mlp.gate_proj.weight"
         upName = prefix <> ".mlp.up_proj.weight"
@@ -374,17 +373,13 @@ loadGemmaModel modelPath config = do
                     else pure Nothing
 
     -- Post-attention normalization (Gemma 3)
-    -- CORRECTED: post_attention_norm.weight is the ACTUAL post-attn norm (zero-centered)
-    -- post_attention_layernorm.weight is used as pre-FFN norm (see line 330)
-    -- These are DIFFERENT weights with different purposes!
-    let postAttnNormName = prefix <> ".post_attention_norm.weight"  -- Primary: zero-centered norm
-        postAttnNormNameOld = prefix <> ".post_attention_layernorm.weight"  -- Fallback
+    -- PyTorch applies this AFTER attention, BEFORE residual add
+    -- Weight tensor: post_attention_layernorm.weight
+    let postAttnNormName = prefix <> ".post_attention_layernorm.weight"
     postAttnNormWeights <- if gcUsePostAttnNorm config
                            then if hasTensor st postAttnNormName
-                                then Just <$> getTensor st postAttnNormName  -- Prefer _norm over _layernorm!
-                                else if hasTensor st postAttnNormNameOld
-                                     then Just <$> getTensor st postAttnNormNameOld
-                                     else pure Nothing
+                                then Just <$> getTensor st postAttnNormName
+                                else pure Nothing
                            else pure Nothing
 
     -- Post-FFN normalization (Gemma 3)

@@ -89,6 +89,7 @@ test-suite gemma-test
     Gemma.Regression.InferenceSpec
     Gemma.Regression.CompareWithOfficialSpec
     Gemma.Regression.FirstTokenSpec
+    Gemma.Regression.MultiTokenPromptSpec
   hs-source-dirs:   test
   default-language: Haskell2010
   ghc-options:      -Wall -threaded -rtsopts -with-rtsopts=-N

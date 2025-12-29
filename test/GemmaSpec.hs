@@ -37,6 +37,7 @@ import qualified Gemma.Regression.Q4InferenceSpec as Q4InferenceSpec
 import qualified Gemma.Regression.InferenceSpec as InferenceSpec
 import qualified Gemma.Regression.FP32InferenceSpec as FP32InferenceSpec
 import qualified Gemma.Regression.MultiTokenSpec as MultiTokenSpec
+import qualified Gemma.Regression.MultiTokenPromptSpec as MultiTokenPromptSpec
 import qualified Gemma.Regression.CompareWithOfficialSpec as CompareWithOfficialSpec
 import qualified Gemma.Regression.FirstTokenSpec as FirstTokenSpec
 import qualified Gemma.Regression.Layer0WithCacheSpec as Layer0WithCacheSpec
@@ -47,6 +48,7 @@ main :: IO ()
 main = hspec $ do
   describe "Embedding Layer Comparison" EmbeddingSpec.spec
   describe "First Token Generation (TDD PyTorch Comparison)" FirstTokenSpec.spec
+  describe "Multi-Token Prompt (TDD PyTorch Comparison)" MultiTokenPromptSpec.spec
   describe "Layer 0 With KV Cache (TDD PyTorch Comparison)" Layer0WithCacheSpec.spec
   describe "Compare with Official Gemma 3" CompareWithOfficialSpec.spec
   describe "Multi-Token Inference (TDD)" MultiTokenSpec.spec
