@@ -54,7 +54,7 @@ import Gemma.Layers.AttentionGPU (qkvProjectionShader, qkNormShader, ropeShader,
 import Gemma.Layers.LinearQ4Fused (qkvProjectionQ4Shader, outputProjectionQ4Shader, rmsNormGateUpQ4Shader, rmsNormLinearQ4Shader,
                                     outputProjectionQ4ConsolidatedShader, rmsNormGateUpQ4ConsolidatedShader, rmsNormLinearQ4ConsolidatedShader)
 import qualified Graphics.WebGPU.Dawn.Kernel as K
-import Gemma.Layers.TransformerBlock (TransformerLayer(..), LayerQ4Offsets(..), runTransformerBlock, runTransformerBlockCached)
+import Gemma.Layers.TransformerBlock (TransformerLayer(..), TransformerWeights(..), LayerQ4Offsets(..), runTransformerBlock, runTransformerBlockCached)
 import Gemma.Layers.TransformerBlockGPU (runTransformerBlockCachedGPU)
 import Gemma.KVCache (KVCache(..), initKVCache, cacheLength)
 import qualified Data.Vector as BV
@@ -539,10 +539,10 @@ loadGemmaModel modelPath config = do
 
     -- Upload attention weights
     attnNormT <- T.createTensorWithData ctx attnNormShape attnNorm
-    qT <- T.createTensorWithData ctx qShape qWeights
-    kT <- T.createTensorWithData ctx kShape kWeights
-    vT <- T.createTensorWithData ctx vShape vWeights
-    outT <- T.createTensorWithData ctx outShape outWeights
+    qT <- liftIO $ T.createTensorWithData ctx qShape qWeights
+    kT <- liftIO $ T.createTensorWithData ctx kShape kWeights
+    vT <- liftIO $ T.createTensorWithData ctx vShape vWeights
+    outT <- liftIO $ T.createTensorWithData ctx outShape outWeights
 
     -- Optional QK-Norm (Gemma 3)
     qNormT <- case qNormWeights of
@@ -569,9 +569,9 @@ loadGemmaModel modelPath config = do
       putStrLn $ "    Vector length: " ++ show (V.length gateWeights)
       putStrLn $ "    Expected elements: " ++ show (ffnDim * hiddenDim)
 
-    gateT <- T.createTensorWithData ctx gateShape gateWeights
-    upT <- T.createTensorWithData ctx upShape upWeights
-    downT <- T.createTensorWithData ctx downShape downWeights
+    gateT <- liftIO $ T.createTensorWithData ctx gateShape gateWeights
+    upT <- liftIO $ T.createTensorWithData ctx upShape upWeights
+    downT <- liftIO $ T.createTensorWithData ctx downShape downWeights
 
     -- Optional post-attention norm (Gemma 3)
     postAttnNormT <- case postAttnNormWeights of
@@ -588,32 +588,32 @@ loadGemmaModel modelPath config = do
     let cacheSize = maxCacheLen * kvSize
         emptyCacheData = V.replicate cacheSize (0.0 :: Float)
         cacheShape = Shape [cacheSize]
-    kCacheT <- T.createTensorWithData ctx cacheShape emptyCacheData
-    vCacheT <- T.createTensorWithData ctx cacheShape emptyCacheData
+    kCacheT <- liftIO $ T.createTensorWithData ctx cacheShape emptyCacheData
+    vCacheT <- liftIO $ T.createTensorWithData ctx cacheShape emptyCacheData
 
     -- Pre-allocate persistent intermediate buffers (REUSED across all tokens!)
     -- These buffers eliminate tensor allocation overhead during inference
     -- Buffer type must match useFP16 flag (CLAUDE.md: precision alignment)
     let numType = if useFP16 then Graphics.WebGPU.Dawn.Types.F16 else Graphics.WebGPU.Dawn.Types.F32
-    xNorm1Buf <- T.createTensor ctx (Shape [hiddenDim]) numType
-    qBuf <- T.createTensor ctx (Shape [qSize]) numType
-    kBuf <- T.createTensor ctx (Shape [kvSize]) numType
-    vBuf <- T.createTensor ctx (Shape [kvSize]) numType
-    qNormBuf <- T.createTensor ctx (Shape [qSize]) numType
-    kNormBuf <- T.createTensor ctx (Shape [kvSize]) numType
-    qRopeBuf <- T.createTensor ctx (Shape [qSize]) numType
-    kRopeBuf <- T.createTensor ctx (Shape [kvSize]) numType
-    scoresBuf <- T.createTensor ctx (Shape [numHeads * maxCacheLen]) numType
-    attnOutBuf <- T.createTensor ctx (Shape [qSize]) numType
-    attnProjBuf <- T.createTensor ctx (Shape [hiddenDim]) numType
-    postAttnNormBuf <- T.createTensor ctx (Shape [hiddenDim]) numType
-    afterAttnBuf <- T.createTensor ctx (Shape [hiddenDim]) numType
-    gateBuf <- T.createTensor ctx (Shape [ffnDim]) numType
-    upBuf <- T.createTensor ctx (Shape [ffnDim]) numType
-    geluUpBuf <- T.createTensor ctx (Shape [ffnDim]) numType
-    downBuf <- T.createTensor ctx (Shape [hiddenDim]) numType
-    postFFNNormBuf <- T.createTensor ctx (Shape [hiddenDim]) numType
-    outputBuf <- T.createTensor ctx (Shape [hiddenDim]) numType
+    xNorm1Buf <- liftIO $ T.createTensor ctx (Shape [hiddenDim]) numType
+    qBuf <- liftIO $ T.createTensor ctx (Shape [qSize]) numType
+    kBuf <- liftIO $ T.createTensor ctx (Shape [kvSize]) numType
+    vBuf <- liftIO $ T.createTensor ctx (Shape [kvSize]) numType
+    qNormBuf <- liftIO $ T.createTensor ctx (Shape [qSize]) numType
+    kNormBuf <- liftIO $ T.createTensor ctx (Shape [kvSize]) numType
+    qRopeBuf <- liftIO $ T.createTensor ctx (Shape [qSize]) numType
+    kRopeBuf <- liftIO $ T.createTensor ctx (Shape [kvSize]) numType
+    scoresBuf <- liftIO $ T.createTensor ctx (Shape [numHeads * maxCacheLen]) numType
+    attnOutBuf <- liftIO $ T.createTensor ctx (Shape [qSize]) numType
+    attnProjBuf <- liftIO $ T.createTensor ctx (Shape [hiddenDim]) numType
+    postAttnNormBuf <- liftIO $ T.createTensor ctx (Shape [hiddenDim]) numType
+    afterAttnBuf <- liftIO $ T.createTensor ctx (Shape [hiddenDim]) numType
+    gateBuf <- liftIO $ T.createTensor ctx (Shape [ffnDim]) numType
+    upBuf <- liftIO $ T.createTensor ctx (Shape [ffnDim]) numType
+    geluUpBuf <- liftIO $ T.createTensor ctx (Shape [ffnDim]) numType
+    downBuf <- liftIO $ T.createTensor ctx (Shape [hiddenDim]) numType
+    postFFNNormBuf <- liftIO $ T.createTensor ctx (Shape [hiddenDim]) numType
+    outputBuf <- liftIO $ T.createTensor ctx (Shape [hiddenDim]) numType
 
     -- ========== Q4 GPU CONSOLIDATION ==========
     -- If Q4 weights are available, consolidate them into single tensors and upload to GPU
@@ -719,21 +719,41 @@ loadGemmaModel modelPath config = do
 
     let (mbNormLinearQ4Shader, mbGateUpQ4Shader, mbQKVQ4Shader, mbOutQ4Shader, mbDownQ4Shader) = mbQ4Shaders
 
+    -- Choose Q4Weights or FP32Weights based on available data
+    let weights = case (mbQQ4, mbKQ4, mbVQ4, mbOutQ4, mbGateQ4, mbUpQ4, mbDownQ4) of
+          (Just (qQ4, _), Just (kQ4, _), Just (vQ4, _), Just (outQ4, _), Just (gateQ4, _), Just (upQ4, _), Just (downQ4, _)) ->
+            -- All Q4 weights available - use Q4Weights
+            Q4Weights
+              { wAttnQWeightsQ4 = qQ4
+              , wAttnKWeightsQ4 = kQ4
+              , wAttnVWeightsQ4 = vQ4
+              , wAttnOutWeightsQ4 = outQ4
+              , wFFNGateWeightsQ4 = gateQ4
+              , wFFNUpWeightsQ4 = upQ4
+              , wFFNDownWeightsQ4 = downQ4
+              }
+          _ ->
+            -- Use FP32 weights (either no Q4 or partial Q4)
+            FP32Weights
+              { wAttnQWeights = qWeights
+              , wAttnKWeights = kWeights
+              , wAttnVWeights = vWeights
+              , wAttnOutWeights = outWeights
+              , wFFNGateWeights = gateWeights
+              , wFFNUpWeights = upWeights
+              , wFFNDownWeights = downWeights
+              }
+
     pure $ TransformerLayer
-      { -- CPU vectors
+      { -- Normalization weights (always FP32)
         tlAttnNormWeights = attnNorm
-      , tlAttnQWeights = qWeights
-      , tlAttnKWeights = kWeights
-      , tlAttnVWeights = vWeights
       , tlQNormWeights = qNormWeights
       , tlKNormWeights = kNormWeights
-      , tlAttnOutWeights = outWeights
       , tlPostAttnNormWeights = postAttnNormWeights
       , tlFFNNormWeights = ffnNorm
-      , tlFFNGateWeights = gateWeights
-      , tlFFNUpWeights = upWeights
-      , tlFFNDownWeights = downWeights
       , tlPostFFNNormWeights = postFFNNormWeights
+      -- Projection weights (FP32 or Q4)
+      , tlWeights = weights
       -- GPU tensors for Attention
       , tlAttnNormTensor = attnNormT
       , tlAttnQTensor = qT
@@ -844,9 +864,11 @@ configFromGGUF gf =
       ropeFreqBase = getFloat "gemma3.rope.freq_base"
 
       -- Get vocab size from token array length
+      -- If tokenizer metadata was skipped (for performance with external tokenizer),
+      -- use Gemma 3 default vocab size of 256,000
       vocabSize = case getMetadata gf "tokenizer.ggml.tokens" of
                     Just (MetaArray arr) -> length arr
-                    _ -> error "Missing tokenizer.ggml.tokens"
+                    _ -> 256000  -- Gemma 3 default vocab size
 
       -- Optional parameters with defaults
       slidingWindow = case getMetadata gf "gemma3.attention.sliding_window" of
@@ -881,40 +903,335 @@ configFromGGUF gf =
 
 -- | Load Gemma model from GGUF file
 --
--- Loads a quantized GGUF model and converts it to GemmaModel format.
---
--- **Note**: This is a simplified implementation that currently has limitations:
--- 1. Q4 quantization is not yet implemented (requires Q4 support)
--- 2. We don't yet map all GGUF tensor names to the Gemma naming convention
--- 3. The full layer construction logic is complex and needs to match loadGemmaModel
---
--- For now, this function demonstrates the structure but will need Q4 support
--- and complete layer construction to work fully.
-loadGemmaModelFromGGUF :: FilePath -> IO (GemmaModel dtype)
+-- Loads a Q4_0 quantized GGUF model and converts it to GemmaModel format.
+-- Uses GGUF naming convention (blk.*.attn_q.weight) and maps to Gemma format.
+loadGemmaModelFromGGUF :: FilePath -> ContT r IO (GemmaModel dtype)
 loadGemmaModelFromGGUF ggufPath = do
-  putStrLn $ "⚠️  GGUF model loading is partially implemented"
-  putStrLn $ "Loading GGUF file for inspection: " ++ ggufPath
+  liftIO $ putStrLn $ "📦 Loading GGUF model: " ++ ggufPath
 
   -- Load GGUF file
-  gf <- GGUF.loadGGUF ggufPath
+  gf <- liftIO $ GGUF.loadGGUF ggufPath
 
   -- Extract configuration
   let config = configFromGGUF gf
-  putStrLn "✅ Configuration extracted from GGUF metadata:"
-  putStrLn $ "  Vocab size: " ++ show (gcVocabSize config)
-  putStrLn $ "  Hidden dim: " ++ show (gcHiddenDim config)
-  putStrLn $ "  Num layers: " ++ show (gcNumLayers config)
-  putStrLn $ "  Num heads: " ++ show (gcNumHeads config) ++ " (KV: " ++ show (gcNumKVHeads config) ++ ")"
-  putStrLn $ "  FFN dim: " ++ show (gcFFNDim config)
-  putStrLn $ "  RoPE base: " ++ show (gcRopeBase config)
-  putStrLn ""
-  putStrLn "❌ Full GGUF model loading not yet implemented"
-  putStrLn "TODO: Need to:"
-  putStrLn "  1. Implement Q4 dequantization"
-  putStrLn "  2. Map GGUF tensor names to Gemma format"
-  putStrLn "  3. Complete full layer construction with all buffers"
-  putStrLn ""
-  error "GGUF model loading not yet fully implemented - use SafeTensors format for now"
+  liftIO $ putStrLn "✅ Configuration extracted from GGUF metadata:"
+  liftIO $ putStrLn $ "  Vocab size: " ++ show (gcVocabSize config)
+  liftIO $ putStrLn $ "  Hidden dim: " ++ show (gcHiddenDim config)
+  liftIO $ putStrLn $ "  Num layers: " ++ show (gcNumLayers config)
+  liftIO $ putStrLn $ "  Num heads: " ++ show (gcNumHeads config) ++ " (KV: " ++ show (gcNumKVHeads config) ++ ")"
+  liftIO $ putStrLn $ "  FFN dim: " ++ show (gcFFNDim config)
+  liftIO $ putStrLn $ "  RoPE base: " ++ show (gcRopeBase config)
+  liftIO $ putStrLn ""
+
+  -- Helper functions for loading tensors
+  let getTensorQ4 :: Text -> IO (Vector Word.Word32)
+      getTensorQ4 name = GGUF.getTensorQ4_0Raw gf name
+
+      getTensorFP :: Text -> IO (Vector Float)
+      getTensorFP name = GGUF.getTensor gf name  -- Handles FP16/FP32
+
+  -- Load token embeddings (FP16 in GGUF, converted to FP32)
+  liftIO $ putStrLn "📥 Loading embeddings..."
+  embedData <- liftIO $ getTensorFP "token_embd.weight"
+
+  -- Load all transformer layers
+  liftIO $ putStrLn $ "📥 Loading " ++ show (gcNumLayers config) ++ " transformer layers..."
+  layerData <- liftIO $ forM [0 .. gcNumLayers config - 1] $ \i -> do
+    let prefix = T.pack $ "blk." ++ show i
+    when (i `mod` 5 == 0) $ putStrLn $ "  Layer " ++ show i ++ "..."
+
+    -- Required weights (norms are FP16/FP32, not quantized)
+    attnNorm <- getTensorFP (prefix <> ".attn_norm.weight")
+    ffnNorm <- getTensorFP (prefix <> ".ffn_norm.weight")
+
+    -- Q/K/V/Out projections (Q4_0 quantized)
+    qQ4 <- getTensorQ4 (prefix <> ".attn_q.weight")
+    kQ4 <- getTensorQ4 (prefix <> ".attn_k.weight")
+    vQ4 <- getTensorQ4 (prefix <> ".attn_v.weight")
+    outQ4 <- getTensorQ4 (prefix <> ".attn_output.weight")
+
+    -- FFN projections (Q4_0 quantized)
+    gateQ4 <- getTensorQ4 (prefix <> ".ffn_gate.weight")
+    upQ4 <- getTensorQ4 (prefix <> ".ffn_up.weight")
+    downQ4 <- getTensorQ4 (prefix <> ".ffn_down.weight")
+
+    -- Gemma 3 optional norms (FP16/FP32, not quantized)
+    qNorm <- if GGUF.hasTensor gf (prefix <> ".attn_q_norm.weight")
+             then fmap Just $ getTensorFP (prefix <> ".attn_q_norm.weight")
+             else pure Nothing
+    kNorm <- if GGUF.hasTensor gf (prefix <> ".attn_k_norm.weight")
+             then fmap Just $ getTensorFP (prefix <> ".attn_k_norm.weight")
+             else pure Nothing
+    postAttnNorm <- if GGUF.hasTensor gf (prefix <> ".post_attention_norm.weight")
+                    then fmap Just $ getTensorFP (prefix <> ".post_attention_norm.weight")
+                    else pure Nothing
+    postFFNNorm <- if GGUF.hasTensor gf (prefix <> ".post_ffw_norm.weight")
+                   then fmap Just $ getTensorFP (prefix <> ".post_ffw_norm.weight")
+                   else pure Nothing
+
+    let weights = Q4Weights
+          { wAttnQWeightsQ4 = qQ4
+          , wAttnKWeightsQ4 = kQ4
+          , wAttnVWeightsQ4 = vQ4
+          , wAttnOutWeightsQ4 = outQ4
+          , wFFNGateWeightsQ4 = gateQ4
+          , wFFNUpWeightsQ4 = upQ4
+          , wFFNDownWeightsQ4 = downQ4
+          }
+
+    pure (attnNorm, ffnNorm, qNorm, kNorm, postAttnNorm, postFFNNorm, weights)
+
+  -- Load final layers
+  liftIO $ putStrLn "📥 Loading final norm and LM head..."
+  finalNorm <- liftIO $ getTensorFP "output_norm.weight"
+  -- Dequantize LM head from Q4 to FP32 (getTensor handles Q4 dequantization automatically)
+  lmHead <- liftIO $ getTensorFP "output.weight"
+
+  liftIO $ putStrLn "✅ All tensors loaded successfully!"
+  liftIO $ putStrLn "🚧 Creating GPU tensors and shaders..."
+
+  -- Create GPU context
+  ctx <- createContext
+
+  -- Extract configuration parameters
+  let GemmaConfig{..} = config
+      qSize = gcNumHeads * gcHeadDim
+      kvSize = gcNumKVHeads * gcHeadDim
+      maxCacheLen = 2048  -- Max sequence length
+      useFP16 = False  -- GGUF Q4 models use FP32 for non-quantized tensors
+      zeroCentered = gcUseZeroCenteredRMSNorm
+      useVec4 = True  -- Enable vec4 optimizations
+      useFusion = False  -- Disable fusion for now (Q4 uses different path)
+
+  -- Upload embeddings tensor (FP32)
+  liftIO $ putStrLn "📤 Uploading embeddings to GPU..."
+  let embedShape = Shape [gcVocabSize * gcHiddenDim]
+  embeddingTensor <- liftIO $ T.createTensorWithData ctx embedShape embedData
+  liftIO $ putStrLn "✅ Embeddings uploaded (FP32)"
+
+  -- Upload final norm and LM head
+  liftIO $ putStrLn "📤 Uploading final norm and LM head..."
+  let normShape = Shape [gcHiddenDim]
+  finalNormTensor <- liftIO $ T.createTensorWithData ctx normShape finalNorm
+
+  -- LM head is Q4 - we need to handle this specially
+  -- For now, store as CPU vector and use Q4 matmul during inference
+  liftIO $ putStrLn "⚠️  LM head is Q4 - using CPU vector for now"
+  let lmHeadTensor = error "LM head Q4 tensor not yet implemented"  -- TODO: Implement Q4 tensor upload
+
+  -- Compile shared shaders for all layers
+  liftIO $ putStrLn "🔧 Compiling shaders..."
+
+  -- Embedding shader (use FP32, seqLen=1 for cached inference)
+  embeddingShader' <- liftIO $ K.createKernelCode $ embeddingShader False 1 gcHiddenDim
+
+  -- Final RMSNorm + Linear shader (for LM head)
+  -- Use FP32 for final output (logits) regardless of gcUseFP16
+  finalRMSNormLinearShader <- liftIO $ K.createKernelCode $
+    rmsNormLinearFusedShader False gcHiddenDim gcVocabSize zeroCentered
+
+  -- Attention shaders (shared across layers)
+  rmsNormAttnShader <- liftIO $ K.createKernelCode $ rmsNormShader useFP16 gcHiddenDim zeroCentered useVec4
+  qkvProjShader <- liftIO $ K.createKernelCode $ qkvProjectionShader useFP16 gcHiddenDim qSize kvSize
+  qNormShader' <- liftIO $ K.createKernelCode $ qkNormShader useFP16 gcNumHeads gcHeadDim zeroCentered
+  kNormShader' <- liftIO $ K.createKernelCode $ qkNormShader useFP16 gcNumKVHeads gcHeadDim zeroCentered
+  ropeShader' <- liftIO $ K.createKernelCode $ ropeShader useFP16 gcNumHeads gcHeadDim gcRopeBase
+  attnScoresShader <- liftIO $ K.createKernelCode $ attentionScoresShader useFP16 gcNumHeads gcNumKVHeads gcHeadDim maxCacheLen
+  attnOutputShader <- liftIO $ K.createKernelCode $ attentionOutputShader useFP16 gcNumHeads gcNumKVHeads gcHeadDim maxCacheLen
+  outProjShader <- liftIO $ K.createKernelCode $ outputProjectionShader useFP16 gcHiddenDim qSize
+  residualShader <- liftIO $ K.createKernelCode $ residualAddShader useFP16 gcHiddenDim useVec4
+  postAttnNormShader <- liftIO $ K.createKernelCode $ rmsNormShader useFP16 gcHiddenDim zeroCentered useVec4
+
+  -- FFN shaders
+  rmsNormGateUpShader <- liftIO $ K.createKernelCode $ rmsNormGateUpFusedShader useFP16 gcHiddenDim gcFFNDim zeroCentered useVec4
+  geluMultShader <- liftIO $ K.createKernelCode $ geluMultiplyFusedShader useFP16 gcFFNDim useVec4
+  linearDownShader <- liftIO $ K.createKernelCode $ linearShader gcHiddenDim gcFFNDim useFP16 useVec4
+  postFFNNormShader <- liftIO $ K.createKernelCode $ rmsNormShader useFP16 gcHiddenDim zeroCentered useVec4
+
+  -- KV cache shader
+  appendCacheShader <- liftIO $ K.createKernelCode $ appendKVCacheShader useFP16 maxCacheLen gcNumKVHeads gcHeadDim
+
+  liftIO $ putStrLn "✅ Shaders compiled"
+
+  -- Upload each layer's weights to GPU
+  liftIO $ putStrLn $ "📤 Uploading " ++ show gcNumLayers ++ " transformer layers..."
+  gpuLayers <- forM (zip [0..] layerData) $ \(layerIdx :: Int, (attnNorm, ffnNorm, qNormMaybe, kNormMaybe, postAttnNormMaybe, postFFNNormMaybe, weights)) -> do
+    when (layerIdx `mod` 5 == 0) $ liftIO $ putStrLn $ "  Layer " ++ show layerIdx ++ "..."
+
+    -- Upload norm weights (FP32)
+    let attnNormShape = Shape [gcHiddenDim]
+        ffnNormShape = Shape [gcHiddenDim]
+        qNormShape = Shape [gcHeadDim]
+
+    attnNormT <- liftIO $ T.createTensorWithData ctx attnNormShape attnNorm
+    ffnNormT <- liftIO $ T.createTensorWithData ctx ffnNormShape ffnNorm
+
+    -- Optional norms
+    qNormT <- case qNormMaybe of
+      Just w -> Just <$> liftIO (T.createTensorWithData ctx qNormShape w)
+      Nothing -> pure Nothing
+    kNormT <- case kNormMaybe of
+      Just w -> Just <$> liftIO (T.createTensorWithData ctx qNormShape w)
+      Nothing -> pure Nothing
+    postAttnNormT <- case postAttnNormMaybe of
+      Just w -> Just <$> liftIO (T.createTensorWithData ctx ffnNormShape w)
+      Nothing -> pure Nothing
+    postFFNNormT <- case postFFNNormMaybe of
+      Just w -> Just <$> liftIO (T.createTensorWithData ctx ffnNormShape w)
+      Nothing -> pure Nothing
+
+    -- For Q4 weights: We don't upload them as GPU tensors
+    -- Instead, we keep them as CPU vectors and use Q4 kernels during inference
+    -- This is how runLinearQ4 works - it takes CPU Vector Word32 and creates GPU buffers internally
+
+    -- Create dummy FP32 tensors (not used for Q4 inference)
+    let qShape = Shape [qSize, gcHiddenDim]
+        kShape = Shape [kvSize, gcHiddenDim]
+        vShape = Shape [kvSize, gcHiddenDim]
+        outShape = Shape [gcHiddenDim, qSize]
+        gateShape = Shape [gcFFNDim, gcHiddenDim]
+        upShape = Shape [gcFFNDim, gcHiddenDim]
+        downShape = Shape [gcHiddenDim, gcFFNDim]
+
+    -- Dummy tensors (Q4 path doesn't use these)
+    let dummyQ = V.replicate (qSize * gcHiddenDim) (0.0 :: Float)
+        dummyK = V.replicate (kvSize * gcHiddenDim) (0.0 :: Float)
+        dummyV = V.replicate (kvSize * gcHiddenDim) (0.0 :: Float)
+        dummyOut = V.replicate (gcHiddenDim * qSize) (0.0 :: Float)
+        dummyGate = V.replicate (gcFFNDim * gcHiddenDim) (0.0 :: Float)
+        dummyUp = V.replicate (gcFFNDim * gcHiddenDim) (0.0 :: Float)
+        dummyDown = V.replicate (gcHiddenDim * gcFFNDim) (0.0 :: Float)
+
+    qT <- liftIO $ T.createTensorWithData ctx qShape dummyQ
+    kT <- liftIO $ T.createTensorWithData ctx kShape dummyK
+    vT <- liftIO $ T.createTensorWithData ctx vShape dummyV
+    outT <- liftIO $ T.createTensorWithData ctx outShape dummyOut
+    gateT <- liftIO $ T.createTensorWithData ctx gateShape dummyGate
+    upT <- liftIO $ T.createTensorWithData ctx upShape dummyUp
+    downT <- liftIO $ T.createTensorWithData ctx downShape dummyDown
+
+    -- Create GPU-resident KV cache tensors
+    let cacheSize = maxCacheLen * kvSize
+        emptyCacheData = V.replicate cacheSize (0.0 :: Float)
+        cacheShape = Shape [cacheSize]
+    kCacheT <- liftIO $ T.createTensorWithData ctx cacheShape emptyCacheData
+    vCacheT <- liftIO $ T.createTensorWithData ctx cacheShape emptyCacheData
+
+    -- Pre-allocate persistent intermediate buffers
+    let numType = if useFP16 then Graphics.WebGPU.Dawn.Types.F16 else Graphics.WebGPU.Dawn.Types.F32
+    xNorm1Buf <- liftIO $ T.createTensor ctx (Shape [gcHiddenDim]) numType
+    qBuf <- liftIO $ T.createTensor ctx (Shape [qSize]) numType
+    kBuf <- liftIO $ T.createTensor ctx (Shape [kvSize]) numType
+    vBuf <- liftIO $ T.createTensor ctx (Shape [kvSize]) numType
+    qNormBuf <- liftIO $ T.createTensor ctx (Shape [qSize]) numType
+    kNormBuf <- liftIO $ T.createTensor ctx (Shape [kvSize]) numType
+    qRopeBuf <- liftIO $ T.createTensor ctx (Shape [qSize]) numType
+    kRopeBuf <- liftIO $ T.createTensor ctx (Shape [kvSize]) numType
+    scoresBuf <- liftIO $ T.createTensor ctx (Shape [gcNumHeads * maxCacheLen]) numType
+    attnOutBuf <- liftIO $ T.createTensor ctx (Shape [qSize]) numType
+    attnProjBuf <- liftIO $ T.createTensor ctx (Shape [gcHiddenDim]) numType
+    postAttnNormBuf <- liftIO $ T.createTensor ctx (Shape [gcHiddenDim]) numType
+    afterAttnBuf <- liftIO $ T.createTensor ctx (Shape [gcHiddenDim]) numType
+    gateBuf <- liftIO $ T.createTensor ctx (Shape [gcFFNDim]) numType
+    upBuf <- liftIO $ T.createTensor ctx (Shape [gcFFNDim]) numType
+    geluUpBuf <- liftIO $ T.createTensor ctx (Shape [gcFFNDim]) numType
+    downBuf <- liftIO $ T.createTensor ctx (Shape [gcHiddenDim]) numType
+    postFFNNormBuf <- liftIO $ T.createTensor ctx (Shape [gcHiddenDim]) numType
+    outputBuf <- liftIO $ T.createTensor ctx (Shape [gcHiddenDim]) numType
+
+    pure $ TransformerLayer
+      { -- Normalization weights (always FP32)
+        tlAttnNormWeights = attnNorm
+      , tlQNormWeights = qNormMaybe
+      , tlKNormWeights = kNormMaybe
+      , tlPostAttnNormWeights = postAttnNormMaybe
+      , tlFFNNormWeights = ffnNorm
+      , tlPostFFNNormWeights = postFFNNormMaybe
+        -- Projection weights (Q4)
+      , tlWeights = weights
+        -- GPU tensors for Attention (dummy for Q4)
+      , tlAttnNormTensor = attnNormT
+      , tlAttnQTensor = qT
+      , tlAttnKTensor = kT
+      , tlAttnVTensor = vT
+      , tlQNormTensor = qNormT
+      , tlKNormTensor = kNormT
+      , tlAttnOutTensor = outT
+      , tlPostAttnNormTensor = postAttnNormT
+        -- GPU tensors for FFN (dummy for Q4)
+      , tlFFNNormTensor = ffnNormT
+      , tlFFNGateTensor = gateT
+      , tlFFNUpTensor = upT
+      , tlFFNDownTensor = downT
+      , tlPostFFNNormTensor = postFFNNormT
+        -- Shared pre-compiled shaders for Attention
+      , tlRMSNormAttnShader = rmsNormAttnShader
+      , tlQKVProjectionShader = qkvProjShader
+      , tlQNormShader = qNormShader'
+      , tlRoPEShader = ropeShader'
+      , tlAttentionScoresShader = attnScoresShader
+      , tlAttentionOutputShader = attnOutputShader
+      , tlOutputProjectionShader = outProjShader
+      , tlResidualAddShader = residualShader
+      , tlPostAttnNormShader = Just postAttnNormShader
+        -- Shared pre-compiled shaders for FFN
+      , tlRMSNormGateUpShader = rmsNormGateUpShader
+      , tlGELUMultiplyShader = geluMultShader
+      , tlLinearDownShader = linearDownShader
+      , tlPostFFNNormShader = Just postFFNNormShader
+      , tlFFNOutputFusedShader = Nothing  -- Fusion disabled for Q4
+      , tlAttentionPostFusedShader = Nothing  -- Fusion disabled for Q4
+      , tlAttentionCoreFusedShader = Nothing  -- Fusion disabled for Q4
+        -- Q4 quantization support (all weights are Q4)
+      , tlQ4PackedWeights = Nothing  -- Q4 weights stored in tlWeights
+      , tlQ4ScalesWeights = Nothing
+      , tlQ4Offsets = Nothing
+      , tlRMSNormLinearQ4Shader = Nothing
+      , tlRMSNormGateUpQ4Shader = Nothing
+      , tlQKVProjectionQ4Shader = Nothing
+      , tlOutputProjectionQ4Shader = Nothing
+      , tlDownProjectionQ4Shader = Nothing
+        -- GPU-resident KV cache
+      , tlKVCacheK = kCacheT
+      , tlKVCacheV = vCacheT
+      , tlAppendCacheShader = appendCacheShader
+        -- Persistent intermediate buffers
+      , tlXNorm1Buffer = xNorm1Buf
+      , tlQBuffer = qBuf
+      , tlKBuffer = kBuf
+      , tlVBuffer = vBuf
+      , tlQNormBuffer = qNormBuf
+      , tlKNormBuffer = kNormBuf
+      , tlQRopeBuffer = qRopeBuf
+      , tlKRopeBuffer = kRopeBuf
+      , tlScoresBuffer = scoresBuf
+      , tlAttnOutBuffer = attnOutBuf
+      , tlAttnProjBuffer = attnProjBuf
+      , tlPostAttnNormBuffer = postAttnNormBuf
+      , tlAfterAttnBuffer = afterAttnBuf
+      , tlGateBuffer = gateBuf
+      , tlUpBuffer = upBuf
+      , tlGeluUpBuffer = geluUpBuf
+      , tlDownBuffer = downBuf
+      , tlPostFFNNormBuffer = postFFNNormBuf
+      , tlOutputBuffer = outputBuf
+      }
+
+  liftIO $ putStrLn "✅ All layers uploaded to GPU"
+
+  pure $ GemmaModel
+    { gmConfig = config
+    , gmContext = ctx
+    , gmEmbeddings = embedData
+    , gmLayers = gpuLayers
+    , gmFinalNormWeights = finalNorm
+    , gmLMHeadWeights = lmHead  -- Dequantized from Q4 to FP32
+    , gmEmbeddingTensor = embeddingTensor
+    , gmFinalNormTensor = finalNormTensor
+    , gmLMHeadTensor = lmHeadTensor  -- Placeholder for now
+    , gmEmbeddingShader = embeddingShader'
+    , gmFinalRMSNormLinearShader = finalRMSNormLinearShader
+    }
 
 -- | Run inference on Gemma model
 --

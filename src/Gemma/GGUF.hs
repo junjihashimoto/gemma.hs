@@ -264,20 +264,37 @@ parseHeader bs = BS.useAsCString bs $ \ptr -> do
 
   pure (header, 24)  -- 4 + 4 + 8 + 8 = 24 bytes
 
--- | Parse metadata key-value pairs
+-- | Parse metadata key-value pairs (optimized - hoist BS.useAsCString outside loop)
 parseMetadata :: ByteString -> Int -> Word64 -> IO (Map Text MetadataValue, Int)
-parseMetadata bs offset count = go offset (fromIntegral count :: Int) Map.empty 1
-  where
-    go off 0 acc _ = pure (acc, off)
-    go off n acc entryNum = do
-      putStrLn $ "    Parsing metadata entry " ++ show entryNum ++ "/" ++ show (fromIntegral count :: Int)
-      hFlush stdout
-      (key, off1) <- parseString bs off
-      putStrLn $ "      Key: " ++ show key
-      hFlush stdout
-      (valueType, off2) <- parseWord32 bs off1
-      (value, off3) <- parseMetadataValue bs off2 valueType
-      go off3 (n - 1) (Map.insert key value acc) (entryNum + 1)
+parseMetadata bs offset count = do
+  putStrLn "    Optimized metadata parsing (hoisting ByteString pinning)"
+  hFlush stdout
+  -- CRITICAL OPTIMIZATION: Hoist BS.useAsCString OUTSIDE the loop
+  -- This avoids calling it thousands of times on a 1GB ByteString
+  BS.useAsCString bs $ \basePtr -> do
+    let go off 0 acc _ = pure (acc, off)
+        go off n acc entryNum = do
+          putStrLn $ "    Parsing metadata entry " ++ show entryNum ++ "/" ++ show (fromIntegral count :: Int)
+          hFlush stdout
+          -- Use pointer-based parsing (no repeated BS.useAsCString)
+          (key, off1) <- parseStringPtr basePtr bs off
+          putStrLn $ "      Key: " ++ show key
+          hFlush stdout
+          let !valueType = parseWord32Ptr basePtr off1
+          let !off2 = off1 + 4
+          -- Skip tokenizer metadata entirely (we use external tokenizer anyway)
+          if key == "tokenizer.ggml.tokens" || key == "tokenizer.ggml.scores" ||
+             key == "tokenizer.ggml.merges" || key == "tokenizer.ggml.token_type"
+            then do
+              putStrLn "      Skipping tokenizer metadata (using external tokenizer)"
+              hFlush stdout
+              -- Skip the entire value without parsing
+              off3 <- skipMetadataValuePtr basePtr bs off2 valueType
+              go off3 (n - 1) acc (entryNum + 1)  -- Don't insert into map
+            else do
+              (value, off3) <- parseMetadataValuePtr basePtr bs off2 valueType
+              go off3 (n - 1) (Map.insert key value acc) (entryNum + 1)
+    go offset (fromIntegral count :: Int) Map.empty 1
 
 -- | Parse a metadata value based on type
 parseMetadataValue :: ByteString -> Int -> Word32 -> IO (MetadataValue, Int)
@@ -309,6 +326,69 @@ parseArrayValues bs offset elemType count = go offset count []
     go off n acc = do
       (value, off1) <- parseMetadataValue bs off elemType
       go off1 (n - 1) (value : acc)
+
+-- | Skip array values without parsing (for large arrays we don't need)
+skipArrayValues :: ByteString -> Int -> Word32 -> Int -> IO Int
+skipArrayValues bs offset elemType count = go offset count
+  where
+    go off 0 = pure off
+    go off n = do
+      off1 <- skipMetadataValue bs off elemType
+      go off1 (n - 1)
+
+-- | Skip a metadata value and return the offset after it
+skipMetadataValue :: ByteString -> Int -> Word32 -> IO Int
+skipMetadataValue bs offset valueType = case valueType of
+  0  -> pure (offset + 1)  -- UInt8
+  1  -> pure (offset + 1)  -- Int8
+  2  -> pure (offset + 2)  -- UInt16
+  3  -> pure (offset + 2)  -- Int16
+  4  -> pure (offset + 4)  -- UInt32
+  5  -> pure (offset + 4)  -- Int32
+  6  -> pure (offset + 4)  -- Float32
+  7  -> pure (offset + 1)  -- Bool
+  8  -> do  -- String
+    (len, o1) <- parseWord64 bs offset
+    pure (o1 + fromIntegral len)
+  9  -> do  -- Array
+    (arrType, o1) <- parseWord32 bs offset
+    (len, o2) <- parseWord64 bs o1
+    putStrLn $ "      DEBUG: Skipping array with " ++ show len ++ " elements of type " ++ show arrType
+    hFlush stdout
+    -- For arrays of strings (type 8), use optimized bulk skip
+    if arrType == 8 && len > 1000
+      then skipStringArrayFast bs o2 (fromIntegral len)
+      else skipArrayValues bs o2 arrType (fromIntegral len)
+  10 -> pure (offset + 8)  -- UInt64
+  11 -> pure (offset + 8)  -- Int64
+  12 -> pure (offset + 8)  -- Float64
+  _  -> error $ "Unknown metadata value type in skip: " ++ show valueType
+
+-- | Fast skip for large string arrays - hoist useAsCString outside the loop
+-- Root cause: parseWord64 calls BS.useAsCString on the entire ByteString
+-- (which is 1GB) on every iteration. Calling this 262,144 times is slow.
+skipStringArrayFast :: ByteString -> Int -> Int -> IO Int
+skipStringArrayFast bs offset count = do
+  putStrLn $ "      Using fast skip for " ++ show count ++ " strings"
+  putStrLn $ "      DEBUG: ByteString size = " ++ show (BS.length bs) ++ " bytes"
+  hFlush stdout
+  -- Hoist useAsCString OUTSIDE the loop - pin ByteString once, not 262,144 times
+  finalOffset <- BS.useAsCString bs $ \basePtr -> do
+    let go !off 0 = pure off
+        go !off n = do
+          -- Direct pointer read - no BS.useAsCString overhead
+          let ptr = castPtr (plusPtr basePtr off) :: Ptr Word64
+          !len <- peek ptr
+          let !o2 = off + 8 + fromIntegral len
+          -- Progress report every 10,000 strings
+          when (n `mod` 10000 == 0) $ do
+            putStrLn $ "      Progress: " ++ show (count - n) ++ "/" ++ show count
+            hFlush stdout
+          go o2 (n - 1)
+    go offset count
+  putStrLn $ "      Fast skip completed, jumped to offset " ++ show finalOffset
+  hFlush stdout
+  pure finalOffset
 
 -- | Parse tensor infos
 parseTensorInfos :: ByteString -> Int -> Word64 -> IO (Map Text TensorInfo, Int)
@@ -419,6 +499,122 @@ parseString bs offset = do
   let strBytes = BS.take (fromIntegral len) (BS.drop offset1 bs)
       !text = TE.decodeUtf8 strBytes
   pure (text, offset1 + fromIntegral len)
+
+-- ============================================================================
+-- Pointer-based parsing functions (optimized - no repeated BS.useAsCString)
+-- ============================================================================
+
+-- | Parse Word32 using pre-pinned pointer (no BS.useAsCString overhead)
+parseWord32Ptr :: Ptr a -> Int -> Word32
+parseWord32Ptr basePtr offset = unsafePerformIO $ do
+  let p = castPtr (plusPtr basePtr offset) :: Ptr Word32
+  peek p
+
+-- | Parse Word64 using pre-pinned pointer
+parseWord64Ptr :: Ptr a -> Int -> Word64
+parseWord64Ptr basePtr offset = unsafePerformIO $ do
+  let p = castPtr (plusPtr basePtr offset) :: Ptr Word64
+  peek p
+
+-- | Parse string using pre-pinned pointer
+parseStringPtr :: Ptr a -> ByteString -> Int -> IO (Text, Int)
+parseStringPtr basePtr bs offset = do
+  let !len = parseWord64Ptr basePtr offset
+  let !offset1 = offset + 8
+  let strBytes = BS.take (fromIntegral len) (BS.drop offset1 bs)
+      !text = TE.decodeUtf8 strBytes
+  pure (text, offset1 + fromIntegral len)
+
+-- | Parse metadata value using pre-pinned pointer
+parseMetadataValuePtr :: Ptr a -> ByteString -> Int -> Word32 -> IO (MetadataValue, Int)
+parseMetadataValuePtr basePtr bs offset valueType = case valueType of
+  0  -> let !v = unsafePerformIO $ peek (castPtr (plusPtr basePtr offset) :: Ptr Word8)
+        in pure (MetaUInt8 v, offset + 1)
+  1  -> let !v = unsafePerformIO $ peek (castPtr (plusPtr basePtr offset) :: Ptr Int8)
+        in pure (MetaInt8 v, offset + 1)
+  2  -> let !v = unsafePerformIO $ peek (castPtr (plusPtr basePtr offset) :: Ptr Word16)
+        in pure (MetaUInt16 v, offset + 2)
+  3  -> let !v = unsafePerformIO $ peek (castPtr (plusPtr basePtr offset) :: Ptr Int16)
+        in pure (MetaInt16 v, offset + 2)
+  4  -> let !v = parseWord32Ptr basePtr offset
+        in pure (MetaUInt32 v, offset + 4)
+  5  -> let !v = unsafePerformIO $ peek (castPtr (plusPtr basePtr offset) :: Ptr Int32)
+        in pure (MetaInt32 v, offset + 4)
+  6  -> let !v = unsafePerformIO $ peek (castPtr (plusPtr basePtr offset) :: Ptr Float)
+        in pure (MetaFloat32 v, offset + 4)
+  7  -> let !v = unsafePerformIO $ peek (castPtr (plusPtr basePtr offset) :: Ptr Word8)
+        in pure (MetaBool (v /= 0), offset + 1)
+  8  -> do (v, o) <- parseStringPtr basePtr bs offset; pure (MetaString v, o)
+  9  -> do
+    let !arrType = parseWord32Ptr basePtr offset
+    let !len = parseWord64Ptr basePtr (offset + 4)
+    (values, o3) <- parseArrayValuesPtr basePtr bs (offset + 12) arrType (fromIntegral len)
+    pure (MetaArray values, o3)
+  10 -> let !v = parseWord64Ptr basePtr offset
+        in pure (MetaUInt64 v, offset + 8)
+  11 -> let !v = unsafePerformIO $ peek (castPtr (plusPtr basePtr offset) :: Ptr Int64)
+        in pure (MetaInt64 v, offset + 8)
+  12 -> let !v = unsafePerformIO $ peek (castPtr (plusPtr basePtr offset) :: Ptr Double)
+        in pure (MetaFloat64 v, offset + 8)
+  _  -> error $ "Unknown metadata value type: " ++ show valueType
+
+-- | Parse array values using pre-pinned pointer
+parseArrayValuesPtr :: Ptr a -> ByteString -> Int -> Word32 -> Int -> IO ([MetadataValue], Int)
+parseArrayValuesPtr basePtr bs offset elemType count = go offset count []
+  where
+    go off 0 acc = pure (reverse acc, off)
+    go off n acc = do
+      (value, off1) <- parseMetadataValuePtr basePtr bs off elemType
+      go off1 (n - 1) (value : acc)
+
+-- | Skip metadata value using pre-pinned pointer
+skipMetadataValuePtr :: Ptr a -> ByteString -> Int -> Word32 -> IO Int
+skipMetadataValuePtr basePtr bs offset valueType = case valueType of
+  0  -> pure (offset + 1)  -- UInt8
+  1  -> pure (offset + 1)  -- Int8
+  2  -> pure (offset + 2)  -- UInt16
+  3  -> pure (offset + 2)  -- Int16
+  4  -> pure (offset + 4)  -- UInt32
+  5  -> pure (offset + 4)  -- Int32
+  6  -> pure (offset + 4)  -- Float32
+  7  -> pure (offset + 1)  -- Bool
+  8  -> do  -- String
+    let !len = parseWord64Ptr basePtr offset
+    pure (offset + 8 + fromIntegral len)
+  9  -> do  -- Array
+    let !arrType = parseWord32Ptr basePtr offset
+    let !len = parseWord64Ptr basePtr (offset + 4)
+    putStrLn $ "      DEBUG: Skipping array with " ++ show len ++ " elements of type " ++ show arrType
+    hFlush stdout
+    -- For arrays of strings (type 8), use optimized bulk skip
+    if arrType == 8 && len > 1000
+      then skipStringArrayFastPtr basePtr bs (offset + 12) (fromIntegral len)
+      else skipArrayValuesPtr basePtr bs (offset + 12) arrType (fromIntegral len)
+  10 -> pure (offset + 8)  -- UInt64
+  11 -> pure (offset + 8)  -- Int64
+  12 -> pure (offset + 8)  -- Float64
+  _  -> error $ "Unknown metadata value type in skip: " ++ show valueType
+
+-- | Skip array values using pre-pinned pointer
+skipArrayValuesPtr :: Ptr a -> ByteString -> Int -> Word32 -> Int -> IO Int
+skipArrayValuesPtr basePtr bs offset elemType count = go offset count
+  where
+    go off 0 = pure off
+    go off n = do
+      off1 <- skipMetadataValuePtr basePtr bs off elemType
+      go off1 (n - 1)
+
+-- | Fast skip for large string arrays using pre-pinned pointer
+skipStringArrayFastPtr :: Ptr a -> ByteString -> Int -> Int -> IO Int
+skipStringArrayFastPtr basePtr bs offset count = do
+  putStrLn $ "      Using fast skip for " ++ show count ++ " strings (pointer-based)"
+  hFlush stdout
+  let go !off 0 = pure off
+      go !off n = do
+        -- Direct pointer read - no BS.useAsCString overhead
+        let !len = parseWord64Ptr basePtr off
+        go (off + 8 + fromIntegral len) (n - 1)
+  go offset count
 
 -- ============================================================================
 -- Utility functions

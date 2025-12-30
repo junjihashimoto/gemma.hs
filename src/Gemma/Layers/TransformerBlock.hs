@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards #-}
 
 {-|
 Module: Gemma.Layers.TransformerBlock
@@ -30,6 +31,7 @@ Formula:
 
 module Gemma.Layers.TransformerBlock
   ( TransformerLayer(..)
+  , TransformerWeights(..)
   , LayerQ4Offsets(..)
   , runTransformerBlock
   , runTransformerBlockCached
@@ -45,11 +47,13 @@ import System.Environment (lookupEnv)
 
 import Gemma.Layers.RMSNorm (runRMSNormWithContext)
 import Gemma.Layers.Linear (runLinearWithContext)
+import Gemma.Layers.LinearQ4 (runLinearQ4)
 import Gemma.Layers.RoPE (runRoPEWithContext)
 import Gemma.Layers.Attention (runAttentionWithContext)
 import Gemma.Layers.AttentionCached (runAttentionCachedWithContext)
 import Gemma.Layers.MLP (runGeGLUWithContext, runElementwiseAddWithContext)
 import Gemma.KVCache (LayerKVCache)
+import Data.Word (Word32)
 
 -- | Debug print helper (checks DEBUG env var)
 debugPrint :: String -> IO ()
@@ -114,23 +118,42 @@ data LayerQ4Offsets = LayerQ4Offsets
   , q4DownScalesSize :: Int      -- Size of Down scales
   } deriving (Show, Eq)
 
+-- | Projection weights for transformer layers (FP32 or Q4 quantized)
+-- Normalization weights are always FP32 regardless of model type
+data TransformerWeights
+  = FP32Weights
+      { wAttnQWeights :: Vector Float      -- [num_heads * head_dim, hidden_dim]
+      , wAttnKWeights :: Vector Float      -- [num_kv_heads * head_dim, hidden_dim]
+      , wAttnVWeights :: Vector Float      -- [num_kv_heads * head_dim, hidden_dim]
+      , wAttnOutWeights :: Vector Float    -- [hidden_dim, num_heads * head_dim]
+      , wFFNGateWeights :: Vector Float    -- [ffn_dim, hidden_dim]
+      , wFFNUpWeights :: Vector Float      -- [ffn_dim, hidden_dim]
+      , wFFNDownWeights :: Vector Float    -- [hidden_dim, ffn_dim]
+      }
+  | Q4Weights
+      { wAttnQWeightsQ4 :: Vector Word32   -- Q4_0 Q projection
+      , wAttnKWeightsQ4 :: Vector Word32   -- Q4_0 K projection
+      , wAttnVWeightsQ4 :: Vector Word32   -- Q4_0 V projection
+      , wAttnOutWeightsQ4 :: Vector Word32 -- Q4_0 output projection
+      , wFFNGateWeightsQ4 :: Vector Word32 -- Q4_0 gate projection
+      , wFFNUpWeightsQ4 :: Vector Word32   -- Q4_0 up projection
+      , wFFNDownWeightsQ4 :: Vector Word32 -- Q4_0 down projection
+      }
+  deriving (Show, Eq)
+
 -- | Transformer layer weights
 -- CPU vectors for reference + GPU tensors for fast inference
 data TransformerLayer dtype = TransformerLayer
-  { -- CPU vectors (for loading/debugging)
+  { -- Normalization weights (always FP32)
     tlAttnNormWeights :: Vector Float          -- [hidden_dim] - Pre-attention norm
-  , tlAttnQWeights :: Vector Float             -- [num_heads * head_dim, hidden_dim]
-  , tlAttnKWeights :: Vector Float             -- [num_kv_heads * head_dim, hidden_dim]
-  , tlAttnVWeights :: Vector Float             -- [num_kv_heads * head_dim, hidden_dim]
   , tlQNormWeights :: Maybe (Vector Float)     -- [num_heads * head_dim] - QK-Norm for Q (Gemma 3)
   , tlKNormWeights :: Maybe (Vector Float)     -- [num_kv_heads * head_dim] - QK-Norm for K (Gemma 3)
-  , tlAttnOutWeights :: Vector Float           -- [hidden_dim, num_heads * head_dim]
   , tlPostAttnNormWeights :: Maybe (Vector Float)  -- [hidden_dim] - Post-attention norm (Gemma 3)
   , tlFFNNormWeights :: Vector Float           -- [hidden_dim] - Pre-FFN norm
-  , tlFFNGateWeights :: Vector Float           -- [ffn_dim, hidden_dim]
-  , tlFFNUpWeights :: Vector Float             -- [ffn_dim, hidden_dim]
-  , tlFFNDownWeights :: Vector Float           -- [hidden_dim, ffn_dim]
   , tlPostFFNNormWeights :: Maybe (Vector Float)   -- [hidden_dim] - Post-FFN norm (Gemma 3)
+
+  -- Projection weights (FP32 or Q4)
+  , tlWeights :: TransformerWeights
   -- GPU tensors for Attention (uploaded once for performance!)
   , tlAttnNormTensor :: Tensor dtype  -- Pre-attention RMSNorm on GPU
   , tlPostAttnNormTensor :: Maybe (Tensor dtype)  -- Post-attention norm on GPU (Gemma 3)
@@ -233,13 +256,21 @@ runTransformerBlock input layer position numHeads numKVHeads headDim hiddenDim f
   -- Step 1: Pre-attention RMSNorm
   xNorm1 <- runRMSNormWithContext ctx input (tlAttnNormWeights layer)
 
-  -- Step 2: Q, K, V projections
+  -- Step 2: Q, K, V projections (FP32 or Q4)
   let qSize = numHeads * headDim
       kvSize = numKVHeads * headDim
 
-  q <- runLinearWithContext ctx (tlAttnQWeights layer) xNorm1 qSize hiddenDim
-  k <- runLinearWithContext ctx (tlAttnKWeights layer) xNorm1 kvSize hiddenDim
-  v <- runLinearWithContext ctx (tlAttnVWeights layer) xNorm1 kvSize hiddenDim
+  (q, k, v) <- case tlWeights layer of
+    FP32Weights{..} -> do
+      q <- runLinearWithContext ctx wAttnQWeights xNorm1 qSize hiddenDim
+      k <- runLinearWithContext ctx wAttnKWeights xNorm1 kvSize hiddenDim
+      v <- runLinearWithContext ctx wAttnVWeights xNorm1 kvSize hiddenDim
+      pure (q, k, v)
+    Q4Weights{..} -> do
+      q <- runLinearQ4 wAttnQWeightsQ4 xNorm1 qSize hiddenDim False 30.0
+      k <- runLinearQ4 wAttnKWeightsQ4 xNorm1 kvSize hiddenDim False 30.0
+      v <- runLinearQ4 wAttnVWeightsQ4 xNorm1 kvSize hiddenDim False 30.0
+      pure (q, k, v)
 
   -- Step 2.5: Optional QK-Norm (Gemma 3)
   -- Apply RMSNorm to Q and K after projection, before RoPE
@@ -268,8 +299,10 @@ runTransformerBlock input layer position numHeads numKVHeads headDim hiddenDim f
   -- TODO: Handle multi-head properly with head splitting/concatenation
   attnOut <- runAttentionWithContext ctx qRot kExpanded vExpanded 1 (numHeads * headDim) windowSize
 
-  -- Step 6: Output projection
-  attnOutProj <- runLinearWithContext ctx (tlAttnOutWeights layer) attnOut hiddenDim qSize
+  -- Step 6: Output projection (FP32 or Q4)
+  attnOutProj <- case tlWeights layer of
+    FP32Weights{..} -> runLinearWithContext ctx wAttnOutWeights attnOut hiddenDim qSize
+    Q4Weights{..} -> runLinearQ4 wAttnOutWeightsQ4 attnOut hiddenDim qSize False 30.0
 
   -- Step 6.5: Optional post-attention normalization (Gemma 3)
   attnNormed <- case tlPostAttnNormWeights layer of
@@ -282,13 +315,22 @@ runTransformerBlock input layer position numHeads numKVHeads headDim hiddenDim f
   -- Step 8: Pre-MLP RMSNorm
   xNorm2 <- runRMSNormWithContext ctx x (tlFFNNormWeights layer)
 
-  -- Step 9: GeGLU MLP
-  mlpOut <- runGeGLUWithContext ctx xNorm2
-              (tlFFNGateWeights layer)
-              (tlFFNUpWeights layer)
-              (tlFFNDownWeights layer)
-              hiddenDim
-              ffnDim
+  -- Step 9: GeGLU MLP (FP32 or Q4)
+  mlpOut <- case tlWeights layer of
+    FP32Weights{..} -> runGeGLUWithContext ctx xNorm2
+                         wFFNGateWeights
+                         wFFNUpWeights
+                         wFFNDownWeights
+                         hiddenDim
+                         ffnDim
+    Q4Weights{..} -> do
+      -- Q4 GeGLU: gate, up, down projections
+      gate <- runLinearQ4 wFFNGateWeightsQ4 xNorm2 ffnDim hiddenDim False 30.0
+      up <- runLinearQ4 wFFNUpWeightsQ4 xNorm2 ffnDim hiddenDim False 30.0
+      -- GELU activation and element-wise multiply
+      let geluUp = V.zipWith (\g u -> gelu g * u) gate up
+      -- Down projection
+      runLinearQ4 wFFNDownWeightsQ4 geluUp hiddenDim ffnDim False 30.0
 
   -- Step 9.5: Optional post-FFN normalization (Gemma 3)
   mlpNormed <- case tlPostFFNNormWeights layer of
@@ -299,6 +341,10 @@ runTransformerBlock input layer position numHeads numKVHeads headDim hiddenDim f
   output <- runElementwiseAddWithContext ctx x mlpNormed
 
   pure output
+  where
+    -- GELU activation function
+    gelu :: Float -> Float
+    gelu x = 0.5 * x * (1.0 + tanh (sqrt (2.0 / pi) * (x + 0.044715 * x * x * x)))
 
 -- | Run a transformer block with KV-cache for autoregressive generation
 --
@@ -331,13 +377,21 @@ runTransformerBlockCached input layer cache position numHeads numKVHeads headDim
   -- DEBUG: Compare with PyTorch's pre-attention RMSNorm output
   liftIO $ debugPrint $ "  DEBUG xNorm1 (pre-attn RMSNorm) first 10: " ++ show (V.take 10 xNorm1)
 
-  -- Step 2: Q, K, V projections (only for current token)
+  -- Step 2: Q, K, V projections (only for current token, FP32 or Q4)
   let qSize = numHeads * headDim
       kvSize = numKVHeads * headDim
 
-  q <- runLinearWithContext ctx (tlAttnQWeights layer) xNorm1 qSize hiddenDim
-  k <- runLinearWithContext ctx (tlAttnKWeights layer) xNorm1 kvSize hiddenDim
-  v <- runLinearWithContext ctx (tlAttnVWeights layer) xNorm1 kvSize hiddenDim
+  (q, k, v) <- case tlWeights layer of
+    FP32Weights{..} -> do
+      q <- runLinearWithContext ctx wAttnQWeights xNorm1 qSize hiddenDim
+      k <- runLinearWithContext ctx wAttnKWeights xNorm1 kvSize hiddenDim
+      v <- runLinearWithContext ctx wAttnVWeights xNorm1 kvSize hiddenDim
+      pure (q, k, v)
+    Q4Weights{..} -> do
+      q <- runLinearQ4 wAttnQWeightsQ4 xNorm1 qSize hiddenDim False 30.0
+      k <- runLinearQ4 wAttnKWeightsQ4 xNorm1 kvSize hiddenDim False 30.0
+      v <- runLinearQ4 wAttnVWeightsQ4 xNorm1 kvSize hiddenDim False 30.0
+      pure (q, k, v)
 
   -- Step 2.5: Optional QK-Norm (Gemma 3)
   qNorm <- case tlQNormWeights layer of
@@ -373,8 +427,10 @@ runTransformerBlockCached input layer cache position numHeads numKVHeads headDim
                                (numHeads * headDim)  -- Full dimension after expansion
                                windowSize
 
-  -- Step 6: Output projection
-  attnOutProj <- runLinearWithContext ctx (tlAttnOutWeights layer) attnOut hiddenDim qSize
+  -- Step 6: Output projection (FP32 or Q4)
+  attnOutProj <- case tlWeights layer of
+    FP32Weights{..} -> runLinearWithContext ctx wAttnOutWeights attnOut hiddenDim qSize
+    Q4Weights{..} -> runLinearQ4 wAttnOutWeightsQ4 attnOut hiddenDim qSize False 30.0
 
   -- Step 6.5: Optional post-attention normalization (Gemma 3)
   attnNormed <- case tlPostAttnNormWeights layer of
@@ -387,13 +443,22 @@ runTransformerBlockCached input layer cache position numHeads numKVHeads headDim
   -- Step 8: Pre-MLP RMSNorm
   xNorm2 <- runRMSNormWithContext ctx x (tlFFNNormWeights layer)
 
-  -- Step 9: GeGLU MLP
-  mlpOut <- runGeGLUWithContext ctx xNorm2
-              (tlFFNGateWeights layer)
-              (tlFFNUpWeights layer)
-              (tlFFNDownWeights layer)
-              hiddenDim
-              ffnDim
+  -- Step 9: GeGLU MLP (FP32 or Q4)
+  mlpOut <- case tlWeights layer of
+    FP32Weights{..} -> runGeGLUWithContext ctx xNorm2
+                         wFFNGateWeights
+                         wFFNUpWeights
+                         wFFNDownWeights
+                         hiddenDim
+                         ffnDim
+    Q4Weights{..} -> do
+      -- Q4 GeGLU: gate, up, down projections
+      gate <- runLinearQ4 wFFNGateWeightsQ4 xNorm2 ffnDim hiddenDim False 30.0
+      up <- runLinearQ4 wFFNUpWeightsQ4 xNorm2 ffnDim hiddenDim False 30.0
+      -- GELU activation and element-wise multiply
+      let geluUp = V.zipWith (\g u -> gelu g * u) gate up
+      -- Down projection
+      runLinearQ4 wFFNDownWeightsQ4 geluUp hiddenDim ffnDim False 30.0
 
   -- Step 9.5: Optional post-FFN normalization (Gemma 3)
   mlpNormed <- case tlPostFFNNormWeights layer of
@@ -404,3 +469,7 @@ runTransformerBlockCached input layer cache position numHeads numKVHeads headDim
   output <- runElementwiseAddWithContext ctx x mlpNormed
 
   pure (output, updatedCache)
+  where
+    -- GELU activation function
+    gelu :: Float -> Float
+    gelu x = 0.5 * x * (1.0 + tanh (sqrt (2.0 / pi) * (x + 0.044715 * x * x * x)))
